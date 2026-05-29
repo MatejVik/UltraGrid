@@ -3112,6 +3112,32 @@ fi
 
 ENSURE_FEATURE_PRESENT([$v4l2_req], [$v4l2], [V4L2 not found])
 
+# -------------------------------------------------------------------------------------------------
+# libcamera
+# -------------------------------------------------------------------------------------------------
+libcamera=no
+
+AC_ARG_ENABLE(libcamera,
+    AS_HELP_STRING([--disable-libcamera], [disable libcamera capture support (default is auto); requires: Linux, libcamera >= 0.7.0]),
+    [libcamera_req=$enableval],
+    [libcamera_req=$build_default]
+    )
+
+if test "$system" = Linux && test "$libcamera_req" != no
+then
+        PKG_CHECK_MODULES([LIBCAMERA], [libcamera >= 0.7.0],
+                [libcamera=yes], [libcamera=no])
+fi
+
+if test "$libcamera" = yes
+then
+        LIBCAMERA_OBJ="src/video_capture/libcamera.o"
+        add_module vidcap_libcamera "$LIBCAMERA_OBJ" "$LIBCAMERA_LIBS"
+        CXXFLAGS="$CXXFLAGS $LIBCAMERA_CFLAGS"
+fi
+
+ENSURE_FEATURE_PRESENT([$libcamera_req], [$libcamera], [libcamera not found])
+
 # -----------------------------------------------------------------------------
 # WASAPI
 # -----------------------------------------------------------------------------
@@ -3850,6 +3876,7 @@ add_column "Screen capture${screen_modules?}" "${screen_cap?}"
 add_column "SDL${sdl_version_str?}" "${sdl?}"
 add_column "SW video mix" "${swmix?}"
 add_column "V4L2" "${v4l2?}"
+add_column "libcamera" "${libcamera?}"
 add_column "Vulkan${vulkan_sdl_ver?}" "${vulkan?}"
 add_column "XIMEA" "${ximea?}"
 end_section
@@ -3914,4 +3941,3 @@ AC_DEFINE_UNQUOTED([SRCDIR], "$srcdir", [path to src directory])
 AC_CONFIG_HEADERS([src/config.h])
 AC_CONFIG_FILES([Makefile])
 AC_OUTPUT
-
