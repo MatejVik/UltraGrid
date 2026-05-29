@@ -215,6 +215,17 @@ void unmap_buffers(vidcap_libcamera_state *s)
         s->mapped_buffers.clear();
 }
 
+void unmap_mapped_buffer(mapped_buffer *mapped)
+{
+        for (mapped_plane &plane : mapped->planes) {
+                if (plane.base != MAP_FAILED) {
+                        munmap(plane.base, plane.map_len);
+                        plane.base = MAP_FAILED;
+                }
+        }
+        mapped->planes.clear();
+}
+
 void vidcap_libcamera_cleanup(vidcap_libcamera_state *s)
 {
         if (s == nullptr) {
@@ -284,6 +295,7 @@ bool map_frame_buffer(vidcap_libcamera_state *s,
                         log_msg(LOG_LEVEL_ERROR,
                                         MOD_NAME "mmap failed: %s\n",
                                         strerror(errno));
+                        unmap_mapped_buffer(&mapped);
                         return false;
                 }
 
@@ -1540,7 +1552,7 @@ struct video_frame *vidcap_libcamera_grab(void *state,
                                 s->frame->tiles[0].data_len = frame_size;
                                 s->frame->timestamp =
                                         buffer->metadata().timestamp * 90 / 1000000;
-                                if (s->copied_frames < 5) {
+                                if (s->copied_frames < 3) {
                                         log_msg(LOG_LEVEL_INFO,
                                                         MOD_NAME "grab copied "
                                                         "frame %u: %ux%u "
