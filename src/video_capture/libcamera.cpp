@@ -83,27 +83,29 @@ void vidcap_libcamera_probe(struct device_info **available_cards, int *count,
                 return;
         }
 
-        const auto &cameras = camera_manager.cameras();
-        if (cameras.empty()) {
-                camera_manager.stop();
-                return;
+        {
+                auto cameras = camera_manager.cameras();
+                if (!cameras.empty()) {
+                        auto *devices = static_cast<device_info *>(
+                                        calloc(cameras.size(),
+                                                sizeof(device_info)));
+                        if (devices != nullptr) {
+                                for (size_t i = 0; i < cameras.size(); ++i) {
+                                        snprintf(devices[i].dev,
+                                                        sizeof devices[i].dev,
+                                                        ":camera=%zu", i);
+                                        snprintf(devices[i].name,
+                                                        sizeof devices[i].name,
+                                                        "%s",
+                                                        cameras[i]->id().c_str());
+                                }
+
+                                *available_cards = devices;
+                                *count = static_cast<int>(cameras.size());
+                        }
+                }
         }
 
-        auto *devices = static_cast<device_info *>(
-                calloc(cameras.size(), sizeof(device_info)));
-        if (devices == nullptr) {
-                camera_manager.stop();
-                return;
-        }
-
-        for (size_t i = 0; i < cameras.size(); ++i) {
-                snprintf(devices[i].dev, sizeof devices[i].dev, ":camera=%zu", i);
-                snprintf(devices[i].name, sizeof devices[i].name, "%s",
-                                cameras[i]->id().c_str());
-        }
-
-        *available_cards = devices;
-        *count = static_cast<int>(cameras.size());
         camera_manager.stop();
 }
 
@@ -165,48 +167,74 @@ int vidcap_libcamera_init(const struct vidcap_params *params, void **state)
                 return VIDCAP_INIT_FAIL;
         }
 
-        const auto &cameras = camera_manager.cameras();
-        if (cameras.empty()) {
-                log_msg(LOG_LEVEL_ERROR, MOD_NAME "no cameras found\n");
-                camera_manager.stop();
-                return VIDCAP_INIT_FAIL;
+        bool have_config = false;
+        {
+                auto cameras = camera_manager.cameras();
+                if (cameras.empty()) {
+                        log_msg(LOG_LEVEL_ERROR, MOD_NAME "no cameras found\n");
+                } else if (opts.camera_index >= cameras.size()) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "camera index %zu out of range "
+                                        "(found %zu cameras)\n",
+                                        opts.camera_index, cameras.size());
+                } else {
+                        std::shared_ptr<libcamera::Camera> camera =
+                                cameras[opts.camera_index];
+                        log_msg(LOG_LEVEL_INFO, MOD_NAME "using camera %zu: %s\n",
+                                        opts.camera_index, camera->id().c_str());
+
+                        if (camera->acquire() != 0) {
+                                log_msg(LOG_LEVEL_ERROR,
+                                                MOD_NAME "failed to acquire camera\n");
+                        } else {
+                                {
+                                        std::unique_ptr<libcamera::CameraConfiguration>
+                                                config =
+                                                        camera->generateConfiguration({
+                                                                libcamera::StreamRole::VideoRecording });
+                                        if (!config || config->empty()) {
+                                                log_msg(LOG_LEVEL_ERROR,
+                                                                MOD_NAME "failed "
+                                                                "to generate "
+                                                                "VideoRecording "
+                                                                "configuration\n");
+                                        } else {
+                                                libcamera::StreamConfiguration
+                                                        &stream_config = config->at(0);
+                                                log_msg(LOG_LEVEL_INFO,
+                                                                MOD_NAME "proposed "
+                                                                "stream: pixelFormat=%s "
+                                                                "size=%s stride=%u "
+                                                                "frameSize=%u "
+                                                                "bufferCount=%u\n",
+                                                                stream_config.pixelFormat
+                                                                        .toString().c_str(),
+                                                                stream_config.size
+                                                                        .toString().c_str(),
+                                                                stream_config.stride,
+                                                                stream_config.frameSize,
+                                                                stream_config.bufferCount);
+
+                                                libcamera::CameraConfiguration::Status
+                                                        status = config->validate();
+                                                log_msg(LOG_LEVEL_INFO,
+                                                                MOD_NAME "configuration "
+                                                                "validation: %s\n",
+                                                                validation_status_to_string(
+                                                                        status));
+                                                have_config = true;
+                                        }
+                                }
+                                camera->release();
+                        }
+                }
         }
-
-        if (opts.camera_index >= cameras.size()) {
-                log_msg(LOG_LEVEL_ERROR,
-                                MOD_NAME "camera index %zu out of range (found %zu cameras)\n",
-                                opts.camera_index, cameras.size());
-                camera_manager.stop();
-                return VIDCAP_INIT_FAIL;
-        }
-
-        std::shared_ptr<libcamera::Camera> camera = cameras[opts.camera_index];
-        log_msg(LOG_LEVEL_INFO, MOD_NAME "using camera %zu: %s\n",
-                        opts.camera_index, camera->id().c_str());
-
-        std::unique_ptr<libcamera::CameraConfiguration> config =
-                camera->generateConfiguration({ libcamera::StreamRole::VideoRecording });
-        if (!config || config->empty()) {
-                log_msg(LOG_LEVEL_ERROR,
-                                MOD_NAME "failed to generate VideoRecording configuration\n");
-                camera_manager.stop();
-                return VIDCAP_INIT_FAIL;
-        }
-
-        libcamera::StreamConfiguration &stream_config = config->at(0);
-        log_msg(LOG_LEVEL_INFO,
-                        MOD_NAME "proposed stream: pixelFormat=%s size=%s "
-                        "stride=%u frameSize=%u bufferCount=%u\n",
-                        stream_config.pixelFormat.toString().c_str(),
-                        stream_config.size.toString().c_str(),
-                        stream_config.stride, stream_config.frameSize,
-                        stream_config.bufferCount);
-
-        libcamera::CameraConfiguration::Status status = config->validate();
-        log_msg(LOG_LEVEL_INFO, MOD_NAME "configuration validation: %s\n",
-                        validation_status_to_string(status));
 
         camera_manager.stop();
+
+        if (!have_config) {
+                return VIDCAP_INIT_FAIL;
+        }
 
         log_msg(LOG_LEVEL_ERROR,
                         MOD_NAME "libcamera stream capture not implemented yet\n");
