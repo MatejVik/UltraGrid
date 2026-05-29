@@ -34,18 +34,23 @@
 
 #include "config.h"
 
-#include <cassert>
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cinttypes>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string_view>
 #include <vector>
+
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <libcamera/control_ids.h>
 #include <libcamera/framebuffer_allocator.h>
@@ -55,8 +60,11 @@
 #include "debug.h"
 #include "lib_common.h"
 #include "utils/string_view_utils.hpp"
+#include "video.h"
 #include "video_capture.h"
 #include "video_capture_params.h"
+#include "video_codec.h"
+#include "video_frame.h"
 
 #define MOD_NAME "[libcamera] "
 
@@ -103,25 +111,6 @@ void log_stream_config(const char *label,
                         stream_config.bufferCount);
 }
 
-struct smoke_test_state {
-        std::mutex lock;
-        std::condition_variable completed_cv;
-        unsigned int completed_requests = 0;
-        libcamera::Request *first_completed_request = nullptr;
-
-        void request_completed(libcamera::Request *request)
-        {
-                std::lock_guard<std::mutex> guard(lock);
-                if (request->status() == libcamera::Request::RequestComplete) {
-                        ++completed_requests;
-                        if (first_completed_request == nullptr) {
-                                first_completed_request = request;
-                        }
-                }
-                completed_cv.notify_all();
-        }
-};
-
 void log_frame_buffer(const libcamera::FrameBuffer &buffer)
 {
         const libcamera::FrameMetadata &metadata = buffer.metadata();
@@ -153,18 +142,162 @@ void log_frame_buffer(const libcamera::FrameBuffer &buffer)
         }
 }
 
-bool run_smoke_test(const std::shared_ptr<libcamera::Camera> &camera,
-                const libcamera::StreamConfiguration &stream_config,
-                const libcamera_options &opts)
+void log_frame_buffer_layout(const libcamera::FrameBuffer &buffer)
 {
-        libcamera::Stream *stream = stream_config.stream();
-        if (stream == nullptr) {
-                log_msg(LOG_LEVEL_ERROR, MOD_NAME "configured stream is null\n");
+        auto planes = buffer.planes();
+        log_msg(LOG_LEVEL_INFO, MOD_NAME "buffer planes: %zu\n", planes.size());
+        for (size_t i = 0; i < planes.size(); ++i) {
+                const libcamera::FrameBuffer::Plane &plane = planes[i];
+                log_msg(LOG_LEVEL_INFO,
+                                MOD_NAME "buffer plane %zu: fd=%d offset=%u "
+                                "length=%u\n",
+                                i, plane.fd.get(), plane.offset, plane.length);
+        }
+}
+
+struct mapped_plane {
+        void *base = MAP_FAILED;
+        size_t map_len = 0;
+        const unsigned char *data = nullptr;
+        size_t len = 0;
+};
+
+struct mapped_buffer {
+        std::vector<mapped_plane> planes;
+};
+
+struct vidcap_libcamera_state {
+        std::unique_ptr<libcamera::CameraManager> camera_manager;
+        std::shared_ptr<libcamera::Camera> camera;
+        std::unique_ptr<libcamera::FrameBufferAllocator> allocator;
+        std::vector<std::unique_ptr<libcamera::Request>> requests;
+        std::map<libcamera::FrameBuffer *, mapped_buffer> mapped_buffers;
+        libcamera::Stream *stream = nullptr;
+        libcamera::StreamConfiguration stream_config = {};
+        struct video_desc desc = {};
+        struct video_frame *frame = nullptr;
+        std::mutex lock;
+        std::condition_variable completed_cv;
+        std::deque<libcamera::Request *> completed_requests;
+        bool callback_connected = false;
+        bool camera_started = false;
+        bool camera_acquired = false;
+        bool stopping = false;
+        unsigned int copied_frames = 0;
+
+        void request_completed(libcamera::Request *request)
+        {
+                std::lock_guard<std::mutex> guard(lock);
+                if (!stopping &&
+                                request->status() ==
+                                        libcamera::Request::RequestComplete) {
+                        completed_requests.push_back(request);
+                }
+                completed_cv.notify_all();
+        }
+};
+
+void unmap_buffers(vidcap_libcamera_state *s)
+{
+        for (auto &[buffer, mapped] : s->mapped_buffers) {
+                (void) buffer;
+                for (mapped_plane &plane : mapped.planes) {
+                        if (plane.base != MAP_FAILED) {
+                                munmap(plane.base, plane.map_len);
+                                plane.base = MAP_FAILED;
+                        }
+                }
+        }
+        s->mapped_buffers.clear();
+}
+
+void vidcap_libcamera_cleanup(vidcap_libcamera_state *s)
+{
+        if (s == nullptr) {
+                return;
+        }
+
+        {
+                std::lock_guard<std::mutex> guard(s->lock);
+                s->stopping = true;
+                s->completed_requests.clear();
+        }
+        s->completed_cv.notify_all();
+
+        if (s->camera && s->camera_started) {
+                int ret = s->camera->stop();
+                if (ret != 0) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "camera stop failed: %d\n",
+                                        ret);
+                }
+                s->camera_started = false;
+        }
+        if (s->camera && s->callback_connected) {
+                s->camera->requestCompleted.disconnect(s);
+                s->callback_connected = false;
+        }
+
+        s->requests.clear();
+        unmap_buffers(s);
+        s->allocator.reset();
+
+        if (s->camera && s->camera_acquired) {
+                s->camera->release();
+                s->camera_acquired = false;
+        }
+        s->camera.reset();
+
+        if (s->camera_manager) {
+                s->camera_manager->stop();
+                s->camera_manager.reset();
+        }
+
+        vf_free(s->frame);
+        s->frame = nullptr;
+        delete s;
+}
+
+bool map_frame_buffer(vidcap_libcamera_state *s,
+                libcamera::FrameBuffer *buffer)
+{
+        const long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size <= 0) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "failed to get system page size\n");
                 return false;
         }
 
-        libcamera::FrameBufferAllocator allocator(camera);
-        int alloc_ret = allocator.allocate(stream);
+        mapped_buffer mapped;
+        for (const libcamera::FrameBuffer::Plane &plane : buffer->planes()) {
+                const off_t page_mask = static_cast<off_t>(page_size - 1);
+                const off_t map_offset = plane.offset & ~page_mask;
+                const size_t delta = plane.offset - map_offset;
+                const size_t map_len = delta + plane.length;
+                void *base = mmap(nullptr, map_len, PROT_READ, MAP_SHARED,
+                                plane.fd.get(), map_offset);
+                if (base == MAP_FAILED) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "mmap failed: %s\n",
+                                        strerror(errno));
+                        return false;
+                }
+
+                mapped.planes.push_back({
+                                base,
+                                map_len,
+                                static_cast<const unsigned char *>(base) + delta,
+                                plane.length,
+                });
+        }
+
+        s->mapped_buffers.emplace(buffer, std::move(mapped));
+        return true;
+}
+
+bool setup_mmaps_and_requests(vidcap_libcamera_state *s)
+{
+        int alloc_ret = s->allocator->allocate(s->stream);
         if (alloc_ret < 0) {
                 log_msg(LOG_LEVEL_ERROR,
                                 MOD_NAME "failed to allocate frame buffers: %d\n",
@@ -172,7 +305,7 @@ bool run_smoke_test(const std::shared_ptr<libcamera::Camera> &camera,
                 return false;
         }
 
-        const auto &buffers = allocator.buffers(stream);
+        const auto &buffers = s->allocator->buffers(s->stream);
         log_msg(LOG_LEVEL_INFO, MOD_NAME "allocated %zu frame buffers\n",
                         buffers.size());
         if (buffers.empty()) {
@@ -180,17 +313,21 @@ bool run_smoke_test(const std::shared_ptr<libcamera::Camera> &camera,
                 return false;
         }
 
-        std::vector<std::unique_ptr<libcamera::Request>> requests;
-        requests.reserve(buffers.size());
+        s->requests.reserve(buffers.size());
         for (const std::unique_ptr<libcamera::FrameBuffer> &buffer : buffers) {
+                log_frame_buffer_layout(*buffer);
+                if (!map_frame_buffer(s, buffer.get())) {
+                        return false;
+                }
+
                 std::unique_ptr<libcamera::Request> request =
-                        camera->createRequest();
+                        s->camera->createRequest();
                 if (!request) {
                         log_msg(LOG_LEVEL_ERROR,
                                         MOD_NAME "failed to create request\n");
                         return false;
                 }
-                int add_ret = request->addBuffer(stream, buffer.get());
+                int add_ret = request->addBuffer(s->stream, buffer.get());
                 if (add_ret != 0) {
                         log_msg(LOG_LEVEL_ERROR,
                                         MOD_NAME "failed to add buffer to "
@@ -198,19 +335,20 @@ bool run_smoke_test(const std::shared_ptr<libcamera::Camera> &camera,
                                         add_ret);
                         return false;
                 }
-                requests.push_back(std::move(request));
+                s->requests.push_back(std::move(request));
         }
 
-        smoke_test_state smoke;
-        camera->requestCompleted.connect(&smoke,
-                        &smoke_test_state::request_completed);
+        return true;
+}
 
-        libcamera::ControlList controls(camera->controls());
+bool start_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
+{
+        libcamera::ControlList controls(s->camera->controls());
         libcamera::ControlList *start_controls = nullptr;
         if (opts.fps_set) {
                 const int64_t frame_duration_us =
                         1000000 / static_cast<int64_t>(opts.fps);
-                if (camera->controls().count(
+                if (s->camera->controls().count(
                                 libcamera::controls::FrameDurationLimits.id()) >
                                 0) {
                         controls.set(libcamera::controls::FrameDurationLimits,
@@ -230,69 +368,29 @@ bool run_smoke_test(const std::shared_ptr<libcamera::Camera> &camera,
                 }
         }
 
-        int start_ret = camera->start(start_controls);
+        s->camera->requestCompleted.connect(s,
+                        &vidcap_libcamera_state::request_completed);
+        s->callback_connected = true;
+
+        int start_ret = s->camera->start(start_controls);
         if (start_ret != 0) {
                 log_msg(LOG_LEVEL_ERROR, MOD_NAME "camera start failed: %d\n",
                                 start_ret);
-                camera->requestCompleted.disconnect(&smoke);
                 return false;
         }
+        s->camera_started = true;
 
-        bool queued_all = true;
-        for (const std::unique_ptr<libcamera::Request> &request : requests) {
-                int queue_ret = camera->queueRequest(request.get());
+        for (const std::unique_ptr<libcamera::Request> &request : s->requests) {
+                int queue_ret = s->camera->queueRequest(request.get());
                 if (queue_ret != 0) {
                         log_msg(LOG_LEVEL_ERROR,
                                         MOD_NAME "failed to queue request: %d\n",
                                         queue_ret);
-                        queued_all = false;
-                        break;
+                        return false;
                 }
         }
 
-        bool got_frame = false;
-        libcamera::Request *completed_request = nullptr;
-        if (queued_all) {
-                std::unique_lock<std::mutex> lock(smoke.lock);
-                got_frame = smoke.completed_cv.wait_for(lock,
-                                std::chrono::seconds(3), [&smoke] {
-                                        return smoke.first_completed_request !=
-                                                nullptr;
-                                });
-                completed_request = smoke.first_completed_request;
-        }
-
-        int stop_ret = camera->stop();
-        if (stop_ret != 0) {
-                log_msg(LOG_LEVEL_ERROR, MOD_NAME "camera stop failed: %d\n",
-                                stop_ret);
-        }
-        camera->requestCompleted.disconnect(&smoke);
-
-        if (!queued_all) {
-                return false;
-        }
-        if (!got_frame || completed_request == nullptr) {
-                log_msg(LOG_LEVEL_ERROR,
-                                MOD_NAME "timeout waiting for completed "
-                                "request\n");
-                return false;
-        }
-
-        log_msg(LOG_LEVEL_INFO,
-                        MOD_NAME "completed requests received: %u\n",
-                        smoke.completed_requests);
-        log_stream_config("smoke stream", stream_config);
-
-        libcamera::FrameBuffer *buffer = completed_request->findBuffer(stream);
-        if (buffer == nullptr) {
-                log_msg(LOG_LEVEL_ERROR,
-                                MOD_NAME "completed request has no buffer for "
-                                "stream\n");
-                return false;
-        }
-        log_frame_buffer(*buffer);
-        return stop_ret == 0;
+        return true;
 }
 
 void vidcap_libcamera_probe(struct device_info **available_cards, int *count,
@@ -558,8 +656,7 @@ bool print_camera_help(const std::shared_ptr<libcamera::Camera> &camera,
         return success;
 }
 
-bool inspect_camera_config(const std::shared_ptr<libcamera::Camera> &camera,
-                const libcamera_options &opts, bool caps_only)
+bool inspect_camera_caps(const std::shared_ptr<libcamera::Camera> &camera)
 {
         if (camera->acquire() != 0) {
                 log_msg(LOG_LEVEL_ERROR, MOD_NAME "failed to acquire camera\n");
@@ -579,117 +676,158 @@ bool inspect_camera_config(const std::shared_ptr<libcamera::Camera> &camera,
                         libcamera::StreamConfiguration &stream_config =
                                 config->at(0);
                         log_stream_config("generated stream", stream_config);
-                        if (caps_only) {
-                                log_stream_formats(stream_config);
-                                success = true;
-                        } else {
-                                do {
-                                        const libcamera::PixelFormat requested_pixfmt =
-                                                libcamera::formats::YUV420;
-                                        const libcamera::Size requested_size =
-                                                opts.size;
-                                        libcamera::Size effective_requested_size =
-                                                requested_size;
-                                        bool check_requested_format =
-                                                opts.format_yuv420;
-                                        bool check_requested_size = opts.size_set;
-
-                                        if (opts.size_set) {
-                                                stream_config.size = requested_size;
-                                        }
-                                        if (opts.format_yuv420) {
-                                                stream_config.pixelFormat =
-                                                        requested_pixfmt;
-                                        }
-                                        if (stream_config.bufferCount < 4) {
-                                                stream_config.bufferCount = 4;
-                                        }
-
-                                        if (opts.size_set || opts.format_yuv420 ||
-                                                        opts.fps_set) {
-                                                log_msg(LOG_LEVEL_INFO,
-                                                                MOD_NAME "requested "
-                                                                "overrides: size=%s format=%s "
-                                                                "fps=%s bufferCount=%u\n",
-                                                                check_requested_size ?
-                                                                        effective_requested_size
-                                                                                .toString().c_str() :
-                                                                        "default",
-                                                                check_requested_format ?
-                                                                        requested_pixfmt
-                                                                                .toString().c_str() :
-                                                                        "default",
-                                                                opts.fps_set ? "set" :
-                                                                        "default",
-                                                                stream_config.bufferCount);
-                                        }
-                                if (opts.fps_set) {
-                                        log_msg(LOG_LEVEL_INFO,
-                                                        MOD_NAME "requested fps=%u; "
-                                                        "will apply during "
-                                                        "camera start if "
-                                                        "supported\n",
-                                                        opts.fps);
-                                }
-
-                                libcamera::CameraConfiguration::Status status =
-                                        config->validate();
-                                log_msg(LOG_LEVEL_INFO,
-                                                MOD_NAME "configuration "
-                                                "validation: %s\n",
-                                                validation_status_to_string(status));
-                                log_stream_config("validated stream",
-                                                stream_config);
-
-                                if (status ==
-                                                libcamera::CameraConfiguration::Invalid) {
-                                        log_msg(LOG_LEVEL_ERROR,
-                                                        MOD_NAME "requested "
-                                                        "configuration is invalid\n");
-                                } else if (check_requested_format &&
-                                                stream_config.pixelFormat !=
-                                                        requested_pixfmt) {
-                                        log_msg(LOG_LEVEL_ERROR,
-                                                        MOD_NAME "requested "
-                                                        "YUV420 was adjusted to %s\n",
-                                                        stream_config.pixelFormat
-                                                                .toString().c_str());
-                                } else if (check_requested_size &&
-                                                stream_config.size !=
-                                                        effective_requested_size) {
-                                        log_msg(LOG_LEVEL_ERROR,
-                                                        MOD_NAME "requested size "
-                                                        "%s was adjusted to %s\n",
-                                                        effective_requested_size
-                                                                .toString().c_str(),
-                                                        stream_config.size
-                                                                .toString().c_str());
-                                } else {
-                                        int configure_ret =
-                                                camera->configure(config.get());
-                                        if (configure_ret == 0) {
-                                                log_msg(LOG_LEVEL_INFO,
-                                                                MOD_NAME "camera "
-                                                                "configure "
-                                                                "succeeded\n");
-                                                success = run_smoke_test(camera,
-                                                                stream_config,
-                                                                opts);
-                                        } else {
-                                                log_msg(LOG_LEVEL_ERROR,
-                                                                MOD_NAME "camera "
-                                                                "configure "
-                                                                "failed: %d\n",
-                                                                configure_ret);
-                                        }
-                                }
-                                } while (false);
-                        }
+                        log_stream_formats(stream_config);
+                        success = true;
                 }
         }
 
         camera->release();
         return success;
+}
+
+bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
+{
+        if (s->camera->acquire() != 0) {
+                log_msg(LOG_LEVEL_ERROR, MOD_NAME "failed to acquire camera\n");
+                return false;
+        }
+        s->camera_acquired = true;
+
+        std::unique_ptr<libcamera::CameraConfiguration> config =
+                s->camera->generateConfiguration({
+                        libcamera::StreamRole::VideoRecording });
+        if (!config || config->empty()) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "failed to generate VideoRecording "
+                                "configuration\n");
+                return false;
+        }
+
+        libcamera::StreamConfiguration &stream_config = config->at(0);
+        log_stream_config("generated stream", stream_config);
+
+        const libcamera::PixelFormat requested_pixfmt =
+                libcamera::formats::YUV420;
+        const libcamera::Size requested_size = opts.size;
+        libcamera::Size effective_requested_size = requested_size;
+        bool check_requested_format = opts.format_yuv420;
+        bool check_requested_size = opts.size_set;
+
+        if (opts.size_set) {
+                stream_config.size = requested_size;
+        }
+        if (opts.format_yuv420) {
+                stream_config.pixelFormat = requested_pixfmt;
+        }
+        if (stream_config.bufferCount < 4) {
+                stream_config.bufferCount = 4;
+        }
+
+        if (opts.size_set || opts.format_yuv420 || opts.fps_set) {
+                log_msg(LOG_LEVEL_INFO,
+                                MOD_NAME "requested overrides: size=%s "
+                                "format=%s fps=%s bufferCount=%u\n",
+                                check_requested_size ?
+                                        effective_requested_size.toString().c_str() :
+                                        "default",
+                                check_requested_format ?
+                                        requested_pixfmt.toString().c_str() :
+                                        "default",
+                                opts.fps_set ? "set" : "default",
+                                stream_config.bufferCount);
+        }
+        if (opts.fps_set) {
+                log_msg(LOG_LEVEL_INFO,
+                                MOD_NAME "requested fps=%u; will apply during "
+                                "camera start if supported\n",
+                                opts.fps);
+        }
+
+        libcamera::CameraConfiguration::Status status = config->validate();
+        log_msg(LOG_LEVEL_INFO, MOD_NAME "configuration validation: %s\n",
+                        validation_status_to_string(status));
+        log_stream_config("validated stream", stream_config);
+
+        if (status == libcamera::CameraConfiguration::Invalid) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "requested configuration is invalid\n");
+                return false;
+        }
+        if (stream_config.pixelFormat != requested_pixfmt) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "only YUV420 is supported for "
+                                "UltraGrid handoff, got %s\n",
+                                stream_config.pixelFormat.toString().c_str());
+                return false;
+        }
+        if (check_requested_format && stream_config.pixelFormat != requested_pixfmt) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "requested YUV420 was adjusted to %s\n",
+                                stream_config.pixelFormat.toString().c_str());
+                return false;
+        }
+        if (check_requested_size && stream_config.size != effective_requested_size) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "requested size %s was adjusted to %s\n",
+                                effective_requested_size.toString().c_str(),
+                                stream_config.size.toString().c_str());
+                return false;
+        }
+
+        int configure_ret = s->camera->configure(config.get());
+        if (configure_ret != 0) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "camera configure failed: %d\n",
+                                configure_ret);
+                return false;
+        }
+        log_msg(LOG_LEVEL_INFO, MOD_NAME "camera configure succeeded\n");
+
+        s->stream = stream_config.stream();
+        if (s->stream == nullptr) {
+                log_msg(LOG_LEVEL_ERROR, MOD_NAME "configured stream is null\n");
+                return false;
+        }
+        s->stream_config = stream_config;
+
+        const unsigned int width = stream_config.size.width;
+        const unsigned int height = stream_config.size.height;
+        if (stream_config.stride != width) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "unsupported YUV420 stride %u for "
+                                "width %u\n",
+                                stream_config.stride, width);
+                return false;
+        }
+
+        s->desc = {
+                width,
+                height,
+                I420,
+                opts.fps_set ? static_cast<double>(opts.fps) : 0.0,
+                PROGRESSIVE,
+                1,
+        };
+        s->frame = vf_alloc_desc_data(s->desc);
+        if (s->frame == nullptr) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "failed to allocate UltraGrid frame\n");
+                return false;
+        }
+
+        s->allocator = std::make_unique<libcamera::FrameBufferAllocator>(
+                        s->camera);
+        if (!setup_mmaps_and_requests(s)) {
+                return false;
+        }
+        if (!start_camera(s, opts)) {
+                return false;
+        }
+
+        log_msg(LOG_LEVEL_INFO,
+                        MOD_NAME "libcamera capture started: %ux%u I420\n",
+                        width, height);
+        return true;
 }
 
 int vidcap_libcamera_init(const struct vidcap_params *params, void **state)
@@ -711,15 +849,16 @@ int vidcap_libcamera_init(const struct vidcap_params *params, void **state)
                 return VIDCAP_INIT_NOERR;
         }
 
-        libcamera::CameraManager camera_manager;
-        if (camera_manager.start() != 0) {
+        auto camera_manager = std::make_unique<libcamera::CameraManager>();
+        if (camera_manager->start() != 0) {
                 log_msg(LOG_LEVEL_ERROR, MOD_NAME "failed to start CameraManager\n");
                 return VIDCAP_INIT_FAIL;
         }
 
         bool have_config = false;
+        vidcap_libcamera_state *new_state = nullptr;
         {
-                auto cameras = camera_manager.cameras();
+                auto cameras = camera_manager->cameras();
                 if (cameras.empty()) {
                         log_msg(LOG_LEVEL_ERROR, MOD_NAME "no cameras found\n");
                 } else if (opts.action == libcamera_options::Action::Help) {
@@ -739,7 +878,7 @@ int vidcap_libcamera_init(const struct vidcap_params *params, void **state)
                                 log_msg(LOG_LEVEL_INFO,
                                                 MOD_NAME "camera %zu: %s\n",
                                                 i, cameras[i]->id().c_str());
-                                inspect_camera_config(cameras[i], opts, true);
+                                inspect_camera_caps(cameras[i]);
                         }
                         have_config = true;
                 } else if (opts.camera_index >= cameras.size()) {
@@ -752,38 +891,137 @@ int vidcap_libcamera_init(const struct vidcap_params *params, void **state)
                                 cameras[opts.camera_index];
                         log_msg(LOG_LEVEL_INFO, MOD_NAME "using camera %zu: %s\n",
                                         opts.camera_index, camera->id().c_str());
-                        have_config = inspect_camera_config(camera, opts, false);
+                        new_state = new vidcap_libcamera_state();
+                        new_state->camera_manager = std::move(camera_manager);
+                        new_state->camera = camera;
+                        have_config = configure_camera(new_state, opts);
                 }
         }
-
-        camera_manager.stop();
 
         if (opts.action == libcamera_options::Action::Help ||
                         opts.action == libcamera_options::Action::List ||
                         opts.action == libcamera_options::Action::Caps) {
+                camera_manager->stop();
                 return VIDCAP_INIT_NOERR;
         }
         if (!have_config) {
+                if (new_state != nullptr) {
+                        vidcap_libcamera_cleanup(new_state);
+                } else if (camera_manager) {
+                        camera_manager->stop();
+                }
                 return VIDCAP_INIT_FAIL;
         }
 
-        log_msg(LOG_LEVEL_ERROR,
-                        MOD_NAME "libcamera UltraGrid frame handoff not "
-                        "implemented yet\n");
-        return VIDCAP_INIT_FAIL;
+        *state = new_state;
+        return VIDCAP_INIT_OK;
 }
 
 void vidcap_libcamera_done(void *state)
 {
-        assert(state == nullptr);
+        vidcap_libcamera_cleanup(static_cast<vidcap_libcamera_state *>(state));
 }
 
 struct video_frame *vidcap_libcamera_grab(void *state,
                 struct audio_frame **audio)
 {
-        assert(state == nullptr);
+        auto *s = static_cast<vidcap_libcamera_state *>(state);
         *audio = nullptr;
-        return nullptr;
+
+        while (true) {
+                libcamera::Request *request = nullptr;
+                {
+                        std::unique_lock<std::mutex> lock(s->lock);
+                        s->completed_cv.wait(lock, [s] {
+                                return s->stopping ||
+                                        !s->completed_requests.empty();
+                        });
+                        if (s->stopping) {
+                                return nullptr;
+                        }
+                        request = s->completed_requests.front();
+                        s->completed_requests.pop_front();
+                }
+
+                libcamera::FrameBuffer *buffer = request->findBuffer(s->stream);
+                if (buffer == nullptr) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "completed request has no "
+                                        "buffer for stream\n");
+                } else {
+                        const unsigned int width = s->stream_config.size.width;
+                        const unsigned int height = s->stream_config.size.height;
+                        const size_t y_size = static_cast<size_t>(width) * height;
+                        const size_t chroma_size = y_size / 4;
+                        const size_t frame_size = y_size + 2 * chroma_size;
+                        const auto planes = buffer->planes();
+                        const auto metadata_planes = buffer->metadata().planes();
+                        auto mapped_it = s->mapped_buffers.find(buffer);
+
+                        if (planes.size() != 3 ||
+                                        metadata_planes.size() < 3 ||
+                                        mapped_it == s->mapped_buffers.end() ||
+                                        mapped_it->second.planes.size() != 3 ||
+                                        s->frame->tiles[0].data_len < frame_size ||
+                                        mapped_it->second.planes[0].len < y_size ||
+                                        mapped_it->second.planes[1].len < chroma_size ||
+                                        mapped_it->second.planes[2].len < chroma_size ||
+                                        metadata_planes[0].bytesused < y_size ||
+                                        metadata_planes[1].bytesused < chroma_size ||
+                                        metadata_planes[2].bytesused < chroma_size) {
+                                log_msg(LOG_LEVEL_ERROR,
+                                                MOD_NAME "unexpected YUV420 "
+                                                "buffer layout, skipping frame\n");
+                        } else {
+                                char *dst = s->frame->tiles[0].data;
+                                const mapped_buffer &mapped = mapped_it->second;
+                                if (s->copied_frames == 0) {
+                                        log_frame_buffer(*buffer);
+                                }
+                                memcpy(dst, mapped.planes[0].data, y_size);
+                                memcpy(dst + y_size, mapped.planes[1].data,
+                                                chroma_size);
+                                memcpy(dst + y_size + chroma_size,
+                                                mapped.planes[2].data,
+                                                chroma_size);
+                                s->frame->tiles[0].data_len = frame_size;
+                                s->frame->timestamp =
+                                        buffer->metadata().timestamp * 90 / 1000000;
+                                if (s->copied_frames < 5) {
+                                        log_msg(LOG_LEVEL_INFO,
+                                                        MOD_NAME "grab copied "
+                                                        "frame %u: %ux%u "
+                                                        "Y=%zu U=%zu V=%zu "
+                                                        "sequence=%u\n",
+                                                        s->copied_frames + 1,
+                                                        width, height, y_size,
+                                                        chroma_size,
+                                                        chroma_size,
+                                                        buffer->metadata().sequence);
+                                }
+                                s->copied_frames += 1;
+
+                                request->reuse(libcamera::Request::ReuseBuffers);
+                                int queue_ret = s->camera->queueRequest(request);
+                                if (queue_ret != 0) {
+                                        log_msg(LOG_LEVEL_ERROR,
+                                                        MOD_NAME "failed to "
+                                                        "requeue request: %d\n",
+                                                        queue_ret);
+                                }
+                                return s->frame;
+                        }
+                }
+
+                request->reuse(libcamera::Request::ReuseBuffers);
+                int queue_ret = s->camera->queueRequest(request);
+                if (queue_ret != 0) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "failed to requeue request: %d\n",
+                                        queue_ret);
+                        return nullptr;
+                }
+        }
 }
 
 const struct video_capture_info vidcap_libcamera_info = {
