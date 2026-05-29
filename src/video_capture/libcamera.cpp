@@ -36,13 +36,19 @@
 
 #include <cassert>
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string_view>
 #include <vector>
 
+#include <libcamera/control_ids.h>
+#include <libcamera/framebuffer_allocator.h>
 #include <libcamera/libcamera.h>
 #include <libcamera/formats.h>
 
@@ -79,10 +85,8 @@ struct libcamera_options {
         } action = Action::Run;
         size_t camera_index = 0;
         libcamera::Size size = {};
-        unsigned int mode = 0;
         unsigned int fps = 0;
         bool size_set = false;
-        bool mode_set = false;
         bool fps_set = false;
         bool format_yuv420 = false;
 };
@@ -97,6 +101,198 @@ void log_stream_config(const char *label,
                         stream_config.size.toString().c_str(),
                         stream_config.stride, stream_config.frameSize,
                         stream_config.bufferCount);
+}
+
+struct smoke_test_state {
+        std::mutex lock;
+        std::condition_variable completed_cv;
+        unsigned int completed_requests = 0;
+        libcamera::Request *first_completed_request = nullptr;
+
+        void request_completed(libcamera::Request *request)
+        {
+                std::lock_guard<std::mutex> guard(lock);
+                if (request->status() == libcamera::Request::RequestComplete) {
+                        ++completed_requests;
+                        if (first_completed_request == nullptr) {
+                                first_completed_request = request;
+                        }
+                }
+                completed_cv.notify_all();
+        }
+};
+
+void log_frame_buffer(const libcamera::FrameBuffer &buffer)
+{
+        const libcamera::FrameMetadata &metadata = buffer.metadata();
+
+        log_msg(LOG_LEVEL_INFO,
+                        MOD_NAME "completed buffer metadata: sequence=%u "
+                        "timestamp=%" PRIu64 " status=%u\n",
+                        metadata.sequence, metadata.timestamp,
+                        static_cast<unsigned int>(metadata.status));
+
+        auto planes = buffer.planes();
+        auto metadata_planes = metadata.planes();
+        log_msg(LOG_LEVEL_INFO, MOD_NAME "buffer planes: %zu\n",
+                        planes.size());
+        for (size_t i = 0; i < planes.size(); ++i) {
+                const libcamera::FrameBuffer::Plane &plane = planes[i];
+                const char *bytesused = "n/a";
+                char bytesused_buf[32] = {};
+                if (i < metadata_planes.size()) {
+                        snprintf(bytesused_buf, sizeof bytesused_buf, "%u",
+                                        metadata_planes[i].bytesused);
+                        bytesused = bytesused_buf;
+                }
+                log_msg(LOG_LEVEL_INFO,
+                                MOD_NAME "buffer plane %zu: fd=%d offset=%u "
+                                "length=%u bytesused=%s\n",
+                                i, plane.fd.get(), plane.offset, plane.length,
+                                bytesused);
+        }
+}
+
+bool run_smoke_test(const std::shared_ptr<libcamera::Camera> &camera,
+                const libcamera::StreamConfiguration &stream_config,
+                const libcamera_options &opts)
+{
+        libcamera::Stream *stream = stream_config.stream();
+        if (stream == nullptr) {
+                log_msg(LOG_LEVEL_ERROR, MOD_NAME "configured stream is null\n");
+                return false;
+        }
+
+        libcamera::FrameBufferAllocator allocator(camera);
+        int alloc_ret = allocator.allocate(stream);
+        if (alloc_ret < 0) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "failed to allocate frame buffers: %d\n",
+                                alloc_ret);
+                return false;
+        }
+
+        const auto &buffers = allocator.buffers(stream);
+        log_msg(LOG_LEVEL_INFO, MOD_NAME "allocated %zu frame buffers\n",
+                        buffers.size());
+        if (buffers.empty()) {
+                log_msg(LOG_LEVEL_ERROR, MOD_NAME "no frame buffers allocated\n");
+                return false;
+        }
+
+        std::vector<std::unique_ptr<libcamera::Request>> requests;
+        requests.reserve(buffers.size());
+        for (const std::unique_ptr<libcamera::FrameBuffer> &buffer : buffers) {
+                std::unique_ptr<libcamera::Request> request =
+                        camera->createRequest();
+                if (!request) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "failed to create request\n");
+                        return false;
+                }
+                int add_ret = request->addBuffer(stream, buffer.get());
+                if (add_ret != 0) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "failed to add buffer to "
+                                        "request: %d\n",
+                                        add_ret);
+                        return false;
+                }
+                requests.push_back(std::move(request));
+        }
+
+        smoke_test_state smoke;
+        camera->requestCompleted.connect(&smoke,
+                        &smoke_test_state::request_completed);
+
+        libcamera::ControlList controls(camera->controls());
+        libcamera::ControlList *start_controls = nullptr;
+        if (opts.fps_set) {
+                const int64_t frame_duration_us =
+                        1000000 / static_cast<int64_t>(opts.fps);
+                if (camera->controls().count(
+                                libcamera::controls::FrameDurationLimits.id()) >
+                                0) {
+                        controls.set(libcamera::controls::FrameDurationLimits,
+                                        { frame_duration_us,
+                                                frame_duration_us });
+                        start_controls = &controls;
+                        log_msg(LOG_LEVEL_INFO,
+                                        MOD_NAME "applying fps=%u via "
+                                        "FrameDurationLimits=%" PRId64 " us\n",
+                                        opts.fps, frame_duration_us);
+                } else {
+                        log_msg(LOG_LEVEL_INFO,
+                                        MOD_NAME "requested fps=%u; "
+                                        "FrameDurationLimits control is not "
+                                        "available\n",
+                                        opts.fps);
+                }
+        }
+
+        int start_ret = camera->start(start_controls);
+        if (start_ret != 0) {
+                log_msg(LOG_LEVEL_ERROR, MOD_NAME "camera start failed: %d\n",
+                                start_ret);
+                camera->requestCompleted.disconnect(&smoke);
+                return false;
+        }
+
+        bool queued_all = true;
+        for (const std::unique_ptr<libcamera::Request> &request : requests) {
+                int queue_ret = camera->queueRequest(request.get());
+                if (queue_ret != 0) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "failed to queue request: %d\n",
+                                        queue_ret);
+                        queued_all = false;
+                        break;
+                }
+        }
+
+        bool got_frame = false;
+        libcamera::Request *completed_request = nullptr;
+        if (queued_all) {
+                std::unique_lock<std::mutex> lock(smoke.lock);
+                got_frame = smoke.completed_cv.wait_for(lock,
+                                std::chrono::seconds(3), [&smoke] {
+                                        return smoke.first_completed_request !=
+                                                nullptr;
+                                });
+                completed_request = smoke.first_completed_request;
+        }
+
+        int stop_ret = camera->stop();
+        if (stop_ret != 0) {
+                log_msg(LOG_LEVEL_ERROR, MOD_NAME "camera stop failed: %d\n",
+                                stop_ret);
+        }
+        camera->requestCompleted.disconnect(&smoke);
+
+        if (!queued_all) {
+                return false;
+        }
+        if (!got_frame || completed_request == nullptr) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "timeout waiting for completed "
+                                "request\n");
+                return false;
+        }
+
+        log_msg(LOG_LEVEL_INFO,
+                        MOD_NAME "completed requests received: %u\n",
+                        smoke.completed_requests);
+        log_stream_config("smoke stream", stream_config);
+
+        libcamera::FrameBuffer *buffer = completed_request->findBuffer(stream);
+        if (buffer == nullptr) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "completed request has no buffer for "
+                                "stream\n");
+                return false;
+        }
+        log_frame_buffer(*buffer);
+        return stop_ret == 0;
 }
 
 void vidcap_libcamera_probe(struct device_info **available_cards, int *count,
@@ -142,7 +338,7 @@ void print_usage()
 {
         printf("libcamera capture\n");
         printf("Usage:\n");
-        printf("\t-t libcamera[:d=<index>|camera=<index>][:mode=N|size=WxH][:fps=N][:format=YUV420][:list|caps|help|fullhelp]\n");
+        printf("\t-t libcamera[:d=<index>|camera=<index>][:size=WxH][:fps=N][:format=YUV420][:list|caps|help|fullhelp]\n");
         printf("\n");
 }
 
@@ -151,16 +347,14 @@ void show_fullhelp()
         print_usage();
         printf("Without overrides, libcamera's default VideoRecording configuration is used.\n");
         printf("d=<index>, camera=<index> select a libcamera device; both names are aliases.\n");
-        printf("size=WxH overrides the VideoRecording stream size.\n");
-        printf("fps=N is parsed for future use; it will be applied later through FrameDurationLimits at camera start.\n");
-        printf("format=YUV420 requests YUV420 output. Other formats are not supported yet.\n");
+        printf("size=WxH selects the output stream size.\n");
+        printf("fps=N requests frame rate through FrameDurationLimits when streaming starts.\n");
+        printf("format=YUV420 selects the output pixel format. Other formats are not supported yet.\n");
         printf("list prints only available cameras.\n");
         printf("caps prints detailed libcamera StreamFormats and may be long.\n");
-        printf("help prints a compact device and mode overview.\n");
+        printf("help prints a compact device and output-size overview.\n");
         printf("fullhelp prints this detailed parameter description.\n");
-        printf("mode=N selects an internal mode printed by libcamera:help, not a raw sensor mode.\n");
-        printf("mode=0 uses the default VideoRecording configuration.\n");
-        printf("mode=1+ selects compact YUV420 modes derived from VideoRecording StreamFormats.\n");
+        printf("mode=N is intentionally not part of the public libcamera API because libcamera/RPi sensor modes are a different layer than VideoRecording output.\n");
         printf("The currently supported output format for future frame handoff is YUV420.\n");
         printf("Status: capture is not implemented yet.\n");
 }
@@ -170,7 +364,6 @@ void show_help_header()
         print_usage();
         printf("Examples:\n");
         printf("\t-t libcamera\n");
-        printf("\t-t libcamera:d=0:mode=2:fps=50\n");
         printf("\t-t libcamera:d=0:size=1280x720:fps=50:format=YUV420\n");
         printf("\t-t libcamera:list\n");
         printf("\t-t libcamera:caps\n");
@@ -208,12 +401,6 @@ int parse_fmt(std::string_view fmt, libcamera_options *opts)
                                 return VIDCAP_INIT_FAIL;
                         }
                 } else if (key == "size") {
-                        if (opts->mode_set) {
-                                log_msg(LOG_LEVEL_ERROR,
-                                                MOD_NAME "mode and size cannot "
-                                                "be combined\n");
-                                return VIDCAP_INIT_FAIL;
-                        }
                         auto width = tokenize(val, 'x', '"');
                         auto height = tokenize(val, 'x', '"');
                         unsigned int parsed_width = 0;
@@ -229,18 +416,11 @@ int parse_fmt(std::string_view fmt, libcamera_options *opts)
                         opts->size = { parsed_width, parsed_height };
                         opts->size_set = true;
                 } else if (key == "mode") {
-                        if (opts->size_set) {
-                                log_msg(LOG_LEVEL_ERROR,
-                                                MOD_NAME "mode and size cannot "
-                                                "be combined\n");
-                                return VIDCAP_INIT_FAIL;
-                        }
-                        if (!parse_num(val, opts->mode)) {
-                                log_msg(LOG_LEVEL_ERROR,
-                                                MOD_NAME "failed to parse mode\n");
-                                return VIDCAP_INIT_FAIL;
-                        }
-                        opts->mode_set = true;
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "mode is not supported by "
+                                        "libcamera module; use "
+                                        "size/fps/format\n");
+                        return VIDCAP_INIT_FAIL;
                 } else if (key == "fps") {
                         if (!parse_num(val, opts->fps) || opts->fps == 0) {
                                 log_msg(LOG_LEVEL_ERROR,
@@ -295,15 +475,15 @@ bool size_in_list(const std::vector<libcamera::Size> &sizes,
         return std::find(sizes.begin(), sizes.end(), needle) != sizes.end();
 }
 
-std::vector<libcamera::Size> get_compact_yuv420_modes(
+std::vector<libcamera::Size> get_common_yuv420_sizes(
                 const libcamera::StreamConfiguration &stream_config)
 {
         const std::vector<libcamera::Size> sizes =
                 stream_config.formats().sizes(libcamera::formats::YUV420);
-        std::vector<libcamera::Size> modes;
+        std::vector<libcamera::Size> common_available_sizes;
 
         if (sizes.empty()) {
-                return modes;
+                return common_available_sizes;
         }
 
         const std::vector<libcamera::Size> common_sizes = {
@@ -314,27 +494,20 @@ std::vector<libcamera::Size> get_compact_yuv420_modes(
         };
         for (const libcamera::Size &size : common_sizes) {
                 if (size_in_list(sizes, size)) {
-                        modes.push_back(size);
+                        common_available_sizes.push_back(size);
                 }
         }
 
-        if (modes.empty()) {
-                const size_t max_modes = std::min<size_t>(sizes.size(), 6);
-                for (size_t i = 0; i < max_modes; ++i) {
-                        modes.push_back(sizes[i]);
-                }
-        }
-
-        return modes;
+        return common_available_sizes;
 }
 
-void print_compact_yuv420_modes(
+void print_common_yuv420_sizes(
                 const libcamera::StreamConfiguration &stream_config)
 {
         const std::vector<libcamera::Size> sizes =
                 stream_config.formats().sizes(libcamera::formats::YUV420);
-        const std::vector<libcamera::Size> modes =
-                get_compact_yuv420_modes(stream_config);
+        const std::vector<libcamera::Size> common_sizes =
+                get_common_yuv420_sizes(stream_config);
 
         if (sizes.empty()) {
                 const libcamera::SizeRange range =
@@ -342,18 +515,15 @@ void print_compact_yuv420_modes(
                 printf("  YUV420 size range: %s-%s\n",
                                 range.min.toString().c_str(),
                                 range.max.toString().c_str());
-                return;
+        } else if (!common_sizes.empty()) {
+                printf("  Common YUV420 sizes:\n");
+                for (const libcamera::Size &size : common_sizes) {
+                        printf("    %s\n", size.toString().c_str());
+                }
+        } else {
+                printf("  Use -t libcamera:caps for full YUV420 size list\n");
         }
-
-        printf("  Common YUV420 modes:\n");
-        for (size_t i = 0; i < modes.size(); ++i) {
-                printf("    Mode %zu) YUV420 %s\n", i + 1,
-                                modes[i].toString().c_str());
-        }
-
-        if (sizes.size() > modes.size()) {
-                printf("    ... use -t libcamera:caps for full list\n");
-        }
+        printf("  FPS: request with fps=N; exact support depends on camera/pipeline\n");
 }
 
 bool print_camera_help(const std::shared_ptr<libcamera::Camera> &camera,
@@ -376,10 +546,10 @@ bool print_camera_help(const std::shared_ptr<libcamera::Camera> &camera,
                 } else {
                         libcamera::StreamConfiguration &stream_config =
                                 config->at(0);
-                        printf("  Mode 0) default %s %s\n",
+                        printf("  Default: %s %s\n",
                                         stream_config.pixelFormat.toString().c_str(),
                                         stream_config.size.toString().c_str());
-                        print_compact_yuv420_modes(stream_config);
+                        print_common_yuv420_sizes(stream_config);
                         success = true;
                 }
         }
@@ -420,54 +590,10 @@ bool inspect_camera_config(const std::shared_ptr<libcamera::Camera> &camera,
                                                 opts.size;
                                         libcamera::Size effective_requested_size =
                                                 requested_size;
-                                        bool mode_ok = true;
                                         bool check_requested_format =
                                                 opts.format_yuv420;
                                         bool check_requested_size = opts.size_set;
 
-                                        if (opts.mode_set) {
-                                                if (opts.mode == 0) {
-                                                        log_msg(LOG_LEVEL_INFO,
-                                                                        MOD_NAME "selected "
-                                                                        "mode 0: default "
-                                                                        "VideoRecording\n");
-                                                } else {
-                                                        const std::vector<libcamera::Size>
-                                                                modes =
-                                                                        get_compact_yuv420_modes(
-                                                                                        stream_config);
-                                                        if (opts.mode > modes.size()) {
-                                                                log_msg(LOG_LEVEL_ERROR,
-                                                                                MOD_NAME "mode %u "
-                                                                                "out of range; "
-                                                                                "use -t "
-                                                                                "libcamera:help "
-                                                                                "or -t "
-                                                                                "libcamera:caps\n",
-                                                                                opts.mode);
-                                                                mode_ok = false;
-                                                                break;
-                                                        }
-                                                        effective_requested_size =
-                                                                modes[opts.mode - 1];
-                                                        stream_config.size =
-                                                                effective_requested_size;
-                                                        stream_config.pixelFormat =
-                                                                requested_pixfmt;
-                                                        check_requested_format = true;
-                                                        check_requested_size = true;
-                                                        log_msg(LOG_LEVEL_INFO,
-                                                                        MOD_NAME "selected "
-                                                                        "mode %u: YUV420 "
-                                                                        "%s\n",
-                                                                        opts.mode,
-                                                                        stream_config.size
-                                                                                .toString().c_str());
-                                                }
-                                        }
-                                        if (!mode_ok) {
-                                                break;
-                                        }
                                         if (opts.size_set) {
                                                 stream_config.size = requested_size;
                                         }
@@ -479,16 +605,12 @@ bool inspect_camera_config(const std::shared_ptr<libcamera::Camera> &camera,
                                                 stream_config.bufferCount = 4;
                                         }
 
-                                        if (opts.mode_set || opts.size_set ||
-                                                        opts.format_yuv420 ||
+                                        if (opts.size_set || opts.format_yuv420 ||
                                                         opts.fps_set) {
                                                 log_msg(LOG_LEVEL_INFO,
                                                                 MOD_NAME "requested "
-                                                                "overrides: mode=%s "
-                                                                "size=%s format=%s "
+                                                                "overrides: size=%s format=%s "
                                                                 "fps=%s bufferCount=%u\n",
-                                                                opts.mode_set ?
-                                                                        "set" : "default",
                                                                 check_requested_size ?
                                                                         effective_requested_size
                                                                                 .toString().c_str() :
@@ -504,7 +626,9 @@ bool inspect_camera_config(const std::shared_ptr<libcamera::Camera> &camera,
                                 if (opts.fps_set) {
                                         log_msg(LOG_LEVEL_INFO,
                                                         MOD_NAME "requested fps=%u; "
-                                                        "fps not applied yet\n",
+                                                        "will apply during "
+                                                        "camera start if "
+                                                        "supported\n",
                                                         opts.fps);
                                 }
 
@@ -548,7 +672,9 @@ bool inspect_camera_config(const std::shared_ptr<libcamera::Camera> &camera,
                                                                 MOD_NAME "camera "
                                                                 "configure "
                                                                 "succeeded\n");
-                                                success = true;
+                                                success = run_smoke_test(camera,
+                                                                stream_config,
+                                                                opts);
                                         } else {
                                                 log_msg(LOG_LEVEL_ERROR,
                                                                 MOD_NAME "camera "
@@ -642,7 +768,8 @@ int vidcap_libcamera_init(const struct vidcap_params *params, void **state)
         }
 
         log_msg(LOG_LEVEL_ERROR,
-                        MOD_NAME "libcamera frame capture not implemented yet\n");
+                        MOD_NAME "libcamera UltraGrid frame handoff not "
+                        "implemented yet\n");
         return VIDCAP_INIT_FAIL;
 }
 
