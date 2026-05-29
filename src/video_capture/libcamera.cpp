@@ -42,6 +42,7 @@
 #include <string_view>
 
 #include <libcamera/libcamera.h>
+#include <libcamera/formats.h>
 
 #include "debug.h"
 #include "lib_common.h"
@@ -68,7 +69,21 @@ const char *validation_status_to_string(libcamera::CameraConfiguration::Status s
 
 struct libcamera_options {
         size_t camera_index = 0;
+        libcamera::Size size = { 1280, 720 };
+        unsigned int fps = 50;
 };
+
+void log_stream_config(const char *label,
+                const libcamera::StreamConfiguration &stream_config)
+{
+        log_msg(LOG_LEVEL_INFO,
+                        MOD_NAME "%s: pixelFormat=%s size=%s stride=%u "
+                        "frameSize=%u bufferCount=%u\n",
+                        label, stream_config.pixelFormat.toString().c_str(),
+                        stream_config.size.toString().c_str(),
+                        stream_config.stride, stream_config.frameSize,
+                        stream_config.bufferCount);
+}
 
 void vidcap_libcamera_probe(struct device_info **available_cards, int *count,
                 void (**deleter)(void *))
@@ -113,8 +128,9 @@ void show_help()
 {
         printf("libcamera capture\n");
         printf("Usage:\n");
-        printf("\t-t libcamera[:camera=<index>][:help]\n");
+        printf("\t-t libcamera[:camera=<index>][:size=WxH][:fps=N][:help]\n");
         printf("\n");
+        printf("Defaults: size=1280x720, fps=50\n");
         printf("Status: capture is not implemented yet.\n");
 }
 
@@ -135,6 +151,26 @@ int parse_fmt(std::string_view fmt, libcamera_options *opts)
                         if (!parse_num(val, opts->camera_index)) {
                                 log_msg(LOG_LEVEL_ERROR,
                                                 MOD_NAME "failed to parse camera index\n");
+                                return VIDCAP_INIT_FAIL;
+                        }
+                } else if (key == "size") {
+                        auto width = tokenize(val, 'x', '"');
+                        auto height = tokenize(val, 'x', '"');
+                        unsigned int parsed_width = 0;
+                        unsigned int parsed_height = 0;
+                        if (!parse_num(width, parsed_width) ||
+                                        !parse_num(height, parsed_height) ||
+                                        !val.empty() || parsed_width == 0 ||
+                                        parsed_height == 0) {
+                                log_msg(LOG_LEVEL_ERROR,
+                                                MOD_NAME "failed to parse size\n");
+                                return VIDCAP_INIT_FAIL;
+                        }
+                        opts->size = { parsed_width, parsed_height };
+                } else if (key == "fps") {
+                        if (!parse_num(val, opts->fps) || opts->fps == 0) {
+                                log_msg(LOG_LEVEL_ERROR,
+                                                MOD_NAME "failed to parse fps\n");
                                 return VIDCAP_INIT_FAIL;
                         }
                 } else if (!key.empty()) {
@@ -201,19 +237,37 @@ int vidcap_libcamera_init(const struct vidcap_params *params, void **state)
                                         } else {
                                                 libcamera::StreamConfiguration
                                                         &stream_config = config->at(0);
+                                                log_stream_config(
+                                                                "generated stream",
+                                                                stream_config);
+
+                                                const libcamera::PixelFormat
+                                                        requested_pixfmt =
+                                                                libcamera::formats::YUV420;
+                                                const libcamera::Size requested_size =
+                                                        opts.size;
+
+                                                stream_config.size = requested_size;
+                                                stream_config.pixelFormat =
+                                                        requested_pixfmt;
+                                                if (stream_config.bufferCount < 4) {
+                                                        stream_config.bufferCount = 4;
+                                                }
+
                                                 log_msg(LOG_LEVEL_INFO,
-                                                                MOD_NAME "proposed "
+                                                                MOD_NAME "requested "
                                                                 "stream: pixelFormat=%s "
-                                                                "size=%s stride=%u "
-                                                                "frameSize=%u "
+                                                                "size=%s fps=%u "
                                                                 "bufferCount=%u\n",
-                                                                stream_config.pixelFormat
+                                                                requested_pixfmt
                                                                         .toString().c_str(),
-                                                                stream_config.size
+                                                                requested_size
                                                                         .toString().c_str(),
-                                                                stream_config.stride,
-                                                                stream_config.frameSize,
+                                                                opts.fps,
                                                                 stream_config.bufferCount);
+                                                log_msg(LOG_LEVEL_INFO,
+                                                                MOD_NAME "fps not "
+                                                                "applied yet\n");
 
                                                 libcamera::CameraConfiguration::Status
                                                         status = config->validate();
@@ -222,7 +276,50 @@ int vidcap_libcamera_init(const struct vidcap_params *params, void **state)
                                                                 "validation: %s\n",
                                                                 validation_status_to_string(
                                                                         status));
-                                                have_config = true;
+                                                log_stream_config(
+                                                                "validated stream",
+                                                                stream_config);
+
+                                                if (stream_config.pixelFormat !=
+                                                                requested_pixfmt ||
+                                                                stream_config.size !=
+                                                                        requested_size) {
+                                                        log_msg(LOG_LEVEL_ERROR,
+                                                                        MOD_NAME "requested "
+                                                                        "YUV420 %s was "
+                                                                        "adjusted to "
+                                                                        "%s %s\n",
+                                                                        requested_size
+                                                                                .toString().c_str(),
+                                                                        stream_config
+                                                                                .pixelFormat
+                                                                                .toString().c_str(),
+                                                                        stream_config.size
+                                                                                .toString().c_str());
+                                                } else if (status ==
+                                                                libcamera::CameraConfiguration::Invalid) {
+                                                        log_msg(LOG_LEVEL_ERROR,
+                                                                        MOD_NAME "requested "
+                                                                        "configuration is "
+                                                                        "invalid\n");
+                                                } else {
+                                                        int configure_ret =
+                                                                camera->configure(
+                                                                                config.get());
+                                                        if (configure_ret == 0) {
+                                                                log_msg(LOG_LEVEL_INFO,
+                                                                                MOD_NAME
+                                                                                "camera configure "
+                                                                                "succeeded\n");
+                                                                have_config = true;
+                                                        } else {
+                                                                log_msg(LOG_LEVEL_ERROR,
+                                                                                MOD_NAME
+                                                                                "camera configure "
+                                                                                "failed: %d\n",
+                                                                                configure_ret);
+                                                        }
+                                                }
                                         }
                                 }
                                 camera->release();
@@ -237,7 +334,7 @@ int vidcap_libcamera_init(const struct vidcap_params *params, void **state)
         }
 
         log_msg(LOG_LEVEL_ERROR,
-                        MOD_NAME "libcamera stream capture not implemented yet\n");
+                        MOD_NAME "libcamera frame capture not implemented yet\n");
         return VIDCAP_INIT_FAIL;
 }
 
