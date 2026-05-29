@@ -39,6 +39,7 @@
 #include <condition_variable>
 #include <cinttypes>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -46,6 +47,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -90,6 +92,7 @@ struct libcamera_options {
                 Fullhelp,
                 List,
                 Caps,
+                Test,
         } action = Action::Run;
         size_t camera_index = 0;
         libcamera::Size size = {};
@@ -97,6 +100,7 @@ struct libcamera_options {
         bool size_set = false;
         bool fps_set = false;
         bool format_yuv420 = false;
+        bool test_verbose = false;
 };
 
 void log_stream_config(const char *label,
@@ -436,7 +440,7 @@ void print_usage()
 {
         printf("libcamera capture\n");
         printf("Usage:\n");
-        printf("\t-t libcamera[:d=<index>|camera=<index>][:size=WxH][:fps=N][:format=YUV420][:list|caps|help|fullhelp]\n");
+        printf("\t-t libcamera[:d=<index>|camera=<index>][:size=WxH][:fps=N][:format=YUV420][:list|caps|test|help|fullhelp]\n");
         printf("\n");
 }
 
@@ -450,11 +454,15 @@ void show_fullhelp()
         printf("format=YUV420 selects the output pixel format. Other formats are not supported yet.\n");
         printf("list prints only available cameras.\n");
         printf("caps prints detailed libcamera StreamFormats and may be long.\n");
+        printf("test runs a short measured FPS support test for typical values 24..120.\n");
+        printf("test respects d/camera, size and format; fps=N limits test to that single FPS value.\n");
+        printf("test is diagnostic only and does not use the UltraGrid frame handoff path.\n");
+        printf("testverbose keeps libcamera diagnostic logs enabled while running the FPS test.\n");
         printf("help prints a compact device and output-size overview.\n");
         printf("fullhelp prints this detailed parameter description.\n");
         printf("mode=N is intentionally not part of the public libcamera API because libcamera/RPi sensor modes are a different layer than VideoRecording output.\n");
         printf("The currently supported output format for future frame handoff is YUV420.\n");
-        printf("Status: capture is not implemented yet.\n");
+        printf("Status: YUV420 capture handoff is implemented.\n");
 }
 
 void show_help_header()
@@ -465,9 +473,11 @@ void show_help_header()
         printf("\t-t libcamera:d=0:size=1280x720:fps=50:format=YUV420\n");
         printf("\t-t libcamera:list\n");
         printf("\t-t libcamera:caps\n");
+        printf("\t-t libcamera:d=0:size=1280x720:format=YUV420:test\n");
         printf("\n");
         printf("Default uses libcamera's VideoRecording configuration.\n");
         printf("Supported output format for future frame handoff: YUV420.\n");
+        printf("test: measured FPS support test.\n");
         printf("Use -t libcamera:fullhelp for parameter details and -t libcamera:caps for full capabilities.\n");
         printf("\n");
 }
@@ -492,6 +502,11 @@ int parse_fmt(std::string_view fmt, libcamera_options *opts)
                         opts->action = libcamera_options::Action::List;
                 } else if (key == "caps" && val.empty()) {
                         opts->action = libcamera_options::Action::Caps;
+                } else if (key == "test" && val.empty()) {
+                        opts->action = libcamera_options::Action::Test;
+                } else if (key == "testverbose" && val.empty()) {
+                        opts->action = libcamera_options::Action::Test;
+                        opts->test_verbose = true;
                 } else if (key == "camera" || key == "d") {
                         if (!parse_num(val, opts->camera_index)) {
                                 log_msg(LOG_LEVEL_ERROR,
@@ -830,6 +845,541 @@ bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
         return true;
 }
 
+struct fps_test_target {
+        std::string camera_id;
+        libcamera::Size size = {};
+};
+
+struct fps_test_result {
+        unsigned int requested_fps = 0;
+        int64_t duration_us = 0;
+        const char *result = "FAIL";
+        double measured_fps = 0.0;
+        unsigned int frames = 0;
+        std::string note;
+};
+
+struct saved_env {
+        std::string name;
+        std::string value;
+        bool was_set = false;
+};
+
+saved_env set_env_temporarily(const char *name, const char *value)
+{
+        saved_env saved;
+        saved.name = name;
+        const char *old_value = getenv(name);
+        if (old_value != nullptr) {
+                saved.was_set = true;
+                saved.value = old_value;
+        }
+        setenv(name, value, 1);
+        return saved;
+}
+
+void restore_env(const saved_env &saved)
+{
+        if (saved.was_set) {
+                setenv(saved.name.c_str(), saved.value.c_str(), 1);
+        } else {
+                unsetenv(saved.name.c_str());
+        }
+}
+
+struct fps_test_state {
+        std::shared_ptr<libcamera::Camera> camera;
+        libcamera::Stream *stream = nullptr;
+        std::mutex lock;
+        std::condition_variable cv;
+        bool stopping = false;
+        unsigned int completed = 0;
+        unsigned int measured_frames = 0;
+        uint64_t first_timestamp = 0;
+        uint64_t last_timestamp = 0;
+        bool queue_failed = false;
+
+        void request_completed(libcamera::Request *request)
+        {
+                std::lock_guard<std::mutex> guard(lock);
+                if (stopping) {
+                        cv.notify_all();
+                        return;
+                }
+
+                if (request->status() == libcamera::Request::RequestComplete) {
+                        completed += 1;
+                        const unsigned int warmup_frames = 3;
+                        if (completed > warmup_frames) {
+                                const libcamera::FrameBuffer *buffer =
+                                        request->findBuffer(stream);
+                                if (buffer != nullptr) {
+                                        const uint64_t timestamp =
+                                                buffer->metadata().timestamp;
+                                        if (measured_frames == 0) {
+                                                first_timestamp = timestamp;
+                                        }
+                                        last_timestamp = timestamp;
+                                        measured_frames += 1;
+                                }
+                        }
+                }
+
+                request->reuse(libcamera::Request::ReuseBuffers);
+                int queue_ret = camera->queueRequest(request);
+                if (queue_ret != 0) {
+                        queue_failed = true;
+                }
+                cv.notify_all();
+        }
+};
+
+bool configure_test_stream(libcamera::Camera *camera,
+                const libcamera_options &opts,
+                std::unique_ptr<libcamera::CameraConfiguration> *config_out,
+                std::string *error)
+{
+        std::unique_ptr<libcamera::CameraConfiguration> config =
+                camera->generateConfiguration({
+                        libcamera::StreamRole::VideoRecording });
+        if (!config || config->empty()) {
+                *error = "generateConfiguration failed";
+                return false;
+        }
+
+        libcamera::StreamConfiguration &stream_config = config->at(0);
+        if (opts.size_set) {
+                stream_config.size = opts.size;
+        }
+        stream_config.pixelFormat = libcamera::formats::YUV420;
+        if (stream_config.bufferCount < 4) {
+                stream_config.bufferCount = 4;
+        }
+
+        libcamera::CameraConfiguration::Status status = config->validate();
+        if (status == libcamera::CameraConfiguration::Invalid) {
+                *error = "configuration invalid";
+                return false;
+        }
+        if (stream_config.pixelFormat != libcamera::formats::YUV420) {
+                *error = "YUV420 not supported for requested configuration";
+                return false;
+        }
+        if (opts.size_set && stream_config.size != opts.size) {
+                *error = "requested size adjusted to " +
+                        stream_config.size.toString();
+                return false;
+        }
+
+        *config_out = std::move(config);
+        return true;
+}
+
+bool get_fps_test_target(const libcamera_options &opts, fps_test_target *target)
+{
+        libcamera::CameraManager camera_manager;
+        if (camera_manager.start() != 0) {
+                log_msg(LOG_LEVEL_ERROR, MOD_NAME "failed to start CameraManager\n");
+                return false;
+        }
+
+        bool ok = false;
+        {
+                auto cameras = camera_manager.cameras();
+                if (cameras.empty()) {
+                        log_msg(LOG_LEVEL_ERROR, MOD_NAME "no cameras found\n");
+                } else if (opts.camera_index >= cameras.size()) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "camera index %zu out of range "
+                                        "(found %zu cameras)\n",
+                                        opts.camera_index, cameras.size());
+                } else {
+                        std::shared_ptr<libcamera::Camera> camera =
+                                cameras[opts.camera_index];
+                        target->camera_id = camera->id();
+                        if (camera->acquire() != 0) {
+                                log_msg(LOG_LEVEL_ERROR,
+                                                MOD_NAME "failed to acquire "
+                                                "camera\n");
+                        } else {
+                                std::unique_ptr<libcamera::CameraConfiguration>
+                                        config;
+                                std::string error;
+                                ok = configure_test_stream(camera.get(), opts,
+                                                &config, &error);
+                                if (ok) {
+                                        target->size = config->at(0).size;
+                                } else {
+                                        log_msg(LOG_LEVEL_ERROR,
+                                                        MOD_NAME "%s\n",
+                                                        error.c_str());
+                                }
+                                camera->release();
+                        }
+                }
+        }
+
+        camera_manager.stop();
+        return ok;
+}
+
+fps_test_result run_fps_test_attempt(const libcamera_options &opts,
+                unsigned int fps)
+{
+        fps_test_result result;
+        result.requested_fps = fps;
+        result.duration_us = static_cast<int64_t>(
+                        std::llround(1000000.0 / fps));
+
+        libcamera::CameraManager camera_manager;
+        if (camera_manager.start() != 0) {
+                result.note = "CameraManager start failed";
+                return result;
+        }
+
+        std::shared_ptr<libcamera::Camera> camera;
+        bool camera_acquired = false;
+        bool callback_connected = false;
+        bool camera_started = false;
+        std::unique_ptr<libcamera::FrameBufferAllocator> allocator;
+        std::vector<std::unique_ptr<libcamera::Request>> requests;
+        std::unique_ptr<libcamera::CameraConfiguration> config;
+        fps_test_state test_state;
+
+        auto cleanup = [&] {
+                {
+                        std::lock_guard<std::mutex> guard(test_state.lock);
+                        test_state.stopping = true;
+                }
+                test_state.cv.notify_all();
+                if (camera && camera_started) {
+                        camera->stop();
+                        camera_started = false;
+                }
+                if (camera && callback_connected) {
+                        camera->requestCompleted.disconnect(&test_state);
+                        callback_connected = false;
+                }
+                requests.clear();
+                allocator.reset();
+                config.reset();
+                test_state.camera.reset();
+                if (camera && camera_acquired) {
+                        camera->release();
+                        camera_acquired = false;
+                }
+                camera.reset();
+                camera_manager.stop();
+        };
+
+        auto cameras = camera_manager.cameras();
+        if (cameras.empty()) {
+                result.note = "no cameras found";
+                cameras.clear();
+                cleanup();
+                return result;
+        }
+        if (opts.camera_index >= cameras.size()) {
+                result.note = "camera index out of range";
+                cameras.clear();
+                cleanup();
+                return result;
+        }
+
+        camera = cameras[opts.camera_index];
+        cameras.clear();
+        test_state.camera = camera;
+        if (camera->acquire() != 0) {
+                result.note = "camera acquire failed";
+                cleanup();
+                return result;
+        }
+        camera_acquired = true;
+
+        std::string error;
+        if (!configure_test_stream(camera.get(), opts, &config, &error)) {
+                result.note = error;
+                cleanup();
+                return result;
+        }
+
+        int configure_ret = camera->configure(config.get());
+        if (configure_ret != 0) {
+                result.note = "configure failed";
+                cleanup();
+                return result;
+        }
+
+        libcamera::StreamConfiguration &stream_config = config->at(0);
+        libcamera::Stream *stream = stream_config.stream();
+        if (stream == nullptr) {
+                result.note = "configured stream is null";
+                cleanup();
+                return result;
+        }
+        test_state.stream = stream;
+
+        allocator = std::make_unique<libcamera::FrameBufferAllocator>(camera);
+        int alloc_ret = allocator->allocate(stream);
+        if (alloc_ret < 0) {
+                result.note = "buffer allocation failed";
+                cleanup();
+                return result;
+        }
+
+        const auto &buffers = allocator->buffers(stream);
+        if (buffers.empty()) {
+                result.note = "no buffers allocated";
+                cleanup();
+                return result;
+        }
+        for (const std::unique_ptr<libcamera::FrameBuffer> &buffer : buffers) {
+                std::unique_ptr<libcamera::Request> request =
+                        camera->createRequest();
+                if (!request) {
+                        result.note = "request creation failed";
+                        cleanup();
+                        return result;
+                }
+                int add_ret = request->addBuffer(stream, buffer.get());
+                if (add_ret != 0) {
+                        result.note = "addBuffer failed";
+                        cleanup();
+                        return result;
+                }
+                requests.push_back(std::move(request));
+        }
+
+        libcamera::ControlList controls(camera->controls());
+        if (camera->controls().count(
+                        libcamera::controls::FrameDurationLimits.id()) == 0) {
+                result.note = "FrameDurationLimits unavailable";
+                cleanup();
+                return result;
+        }
+        controls.set(libcamera::controls::FrameDurationLimits,
+                        { result.duration_us, result.duration_us });
+
+        camera->requestCompleted.connect(&test_state,
+                        &fps_test_state::request_completed);
+        callback_connected = true;
+
+        int start_ret = camera->start(&controls);
+        if (start_ret != 0) {
+                result.note = "start failed";
+                cleanup();
+                return result;
+        }
+        camera_started = true;
+
+        for (const std::unique_ptr<libcamera::Request> &request : requests) {
+                int queue_ret = camera->queueRequest(request.get());
+                if (queue_ret != 0) {
+                        result.note = "queueRequest failed";
+                        cleanup();
+                        return result;
+                }
+        }
+
+        const auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::seconds(3);
+        bool enough_samples = false;
+        {
+                std::unique_lock<std::mutex> lock(test_state.lock);
+                while (!test_state.queue_failed &&
+                                std::chrono::steady_clock::now() < deadline) {
+                        if (test_state.measured_frames >= 8 &&
+                                        test_state.last_timestamp >
+                                                test_state.first_timestamp) {
+                                const double span_sec =
+                                        (test_state.last_timestamp -
+                                                test_state.first_timestamp) /
+                                        1000000000.0;
+                                if (span_sec >= 1.0) {
+                                        enough_samples = true;
+                                        break;
+                                }
+                        }
+                        test_state.cv.wait_until(lock, deadline);
+                }
+        }
+
+        {
+                std::lock_guard<std::mutex> guard(test_state.lock);
+                result.frames = test_state.measured_frames;
+                if (test_state.queue_failed) {
+                        result.note = "requeue failed";
+                } else if (test_state.measured_frames >= 2 &&
+                                test_state.last_timestamp >
+                                        test_state.first_timestamp) {
+                        const double span_sec =
+                                (test_state.last_timestamp -
+                                        test_state.first_timestamp) /
+                                1000000000.0;
+                        result.measured_fps =
+                                (test_state.measured_frames - 1) / span_sec;
+                }
+        }
+
+        if (result.note.empty()) {
+                if (!enough_samples && result.frames == 0) {
+                        result.result = "TIMEOUT";
+                        result.note = "no completed requests";
+                } else if (!enough_samples && result.frames < 8) {
+                        result.result = "TIMEOUT";
+                        result.note = "insufficient completed requests";
+                } else if (result.measured_fps <= 0.0) {
+                        result.result = "TIMEOUT";
+                        result.note = "timestamp measurement unavailable";
+                } else {
+                        const double tolerance = fps <= 30 ? 0.15 : 0.10;
+                        const double rel_error =
+                                std::abs(result.measured_fps - fps) / fps;
+                        result.result = rel_error <= tolerance ? "OK" :
+                                "ADJUSTED";
+                }
+        }
+
+        cleanup();
+        return result;
+}
+
+int run_fps_test(const libcamera_options &opts)
+{
+        std::vector<saved_env> saved_envs;
+        if (!opts.test_verbose) {
+                saved_envs.push_back(set_env_temporarily(
+                                "LIBCAMERA_LOG_LEVELS", "*:ERROR"));
+        }
+
+        if (opts.fps_set) {
+                log_msg(LOG_LEVEL_WARNING,
+                                MOD_NAME "test mode: fps=%u limits test to "
+                                "that single value\n",
+                                opts.fps);
+        }
+
+        fps_test_target target;
+        if (!get_fps_test_target(opts, &target)) {
+                for (const saved_env &saved : saved_envs) {
+                        restore_env(saved);
+                }
+                return VIDCAP_INIT_FAIL;
+        }
+
+        printf("libcamera FPS test\n");
+        printf("Device %zu) %s\n", opts.camera_index, target.camera_id.c_str());
+        printf("Format: YUV420\n");
+        printf("Size: %s\n\n", target.size.toString().c_str());
+        if (!opts.test_verbose) {
+                printf("Running tests...\n\n");
+        }
+
+        const std::vector<unsigned int> default_fps = {
+                24, 25, 30, 50, 60, 75, 90, 100, 120,
+        };
+        const std::vector<unsigned int> fps_values =
+                opts.fps_set ? std::vector<unsigned int>{ opts.fps } :
+                default_fps;
+
+        std::vector<fps_test_result> results;
+        bool have_ok = false;
+        unsigned int consecutive_failures_after_ok = 0;
+        for (unsigned int fps : fps_values) {
+                fps_test_result result = run_fps_test_attempt(opts, fps);
+                if (strcmp(result.result, "ADJUSTED") == 0 &&
+                                result.note.empty()) {
+                        result.note = "limited/adjusted by camera pipeline";
+                }
+                const bool ok_like = strcmp(result.result, "OK") == 0 ||
+                        strcmp(result.result, "ADJUSTED") == 0;
+                if (ok_like) {
+                        have_ok = true;
+                        consecutive_failures_after_ok = 0;
+                } else if (have_ok) {
+                        consecutive_failures_after_ok += 1;
+                }
+                results.push_back(result);
+
+                if (consecutive_failures_after_ok >= 2) {
+                        fps_test_result stop_marker;
+                        stop_marker.requested_fps = fps;
+                        stop_marker.note = "stopped after 2 consecutive failures";
+                        results.back().note = results.back().note.empty() ?
+                                stop_marker.note :
+                                results.back().note + "; " + stop_marker.note;
+                        break;
+                }
+        }
+
+        for (const saved_env &saved : saved_envs) {
+                restore_env(saved);
+        }
+
+        printf("%-9s | %-8s | %-8s | %-6s | %s\n",
+                        "Requested", "Result", "Measured", "Frames", "Note");
+        double highest_ok = 0.0;
+        double first_adjusted = 0.0;
+        double adjusted_limit = 0.0;
+        std::vector<unsigned int> ok_values;
+        for (const fps_test_result &result : results) {
+                char measured[32] = "-";
+                if (result.measured_fps > 0.0) {
+                        snprintf(measured, sizeof measured, "%.1f",
+                                        result.measured_fps);
+                }
+                printf("%-9u | %-8s | %-8s | %-6u | %s\n",
+                                result.requested_fps, result.result, measured,
+                                result.frames, result.note.c_str());
+
+                if (strcmp(result.result, "OK") == 0) {
+                        highest_ok = result.requested_fps;
+                        ok_values.push_back(result.requested_fps);
+                } else if (strcmp(result.result, "ADJUSTED") == 0) {
+                        if (first_adjusted == 0.0) {
+                                first_adjusted = result.requested_fps;
+                        }
+                        if (adjusted_limit == 0.0 ||
+                                        (result.measured_fps > 0.0 &&
+                                                result.measured_fps <
+                                                        adjusted_limit)) {
+                                adjusted_limit = result.measured_fps;
+                        }
+                }
+        }
+
+        printf("\nSummary:\n");
+        if (highest_ok > 0.0) {
+                printf("OK up to: %.0f fps\n", highest_ok);
+        } else {
+                printf("OK up to: none\n");
+        }
+        if (first_adjusted > 0.0) {
+                if (adjusted_limit > 0.0) {
+                        printf("Pipeline limit appears around: %.1f fps\n",
+                                        adjusted_limit);
+                } else {
+                        printf("Pipeline limit appears around: %.0f fps\n",
+                                        first_adjusted);
+                }
+        } else {
+                printf("Pipeline limit appears around: not detected\n");
+        }
+        printf("Recommended stable choices:");
+        if (ok_values.empty()) {
+                printf(" none\n");
+        } else {
+                const size_t max_recommendations =
+                        std::min<size_t>(ok_values.size(), 5);
+                for (size_t i = 0; i < max_recommendations; ++i) {
+                        printf("%s%u", i == 0 ? " " : ", ", ok_values[i]);
+                }
+                printf("\n");
+        }
+
+        return VIDCAP_INIT_NOERR;
+}
+
 int vidcap_libcamera_init(const struct vidcap_params *params, void **state)
 {
         libcamera_options opts;
@@ -847,6 +1397,9 @@ int vidcap_libcamera_init(const struct vidcap_params *params, void **state)
         if (opts.action == libcamera_options::Action::Fullhelp) {
                 show_fullhelp();
                 return VIDCAP_INIT_NOERR;
+        }
+        if (opts.action == libcamera_options::Action::Test) {
+                return run_fps_test(opts);
         }
 
         auto camera_manager = std::make_unique<libcamera::CameraManager>();
