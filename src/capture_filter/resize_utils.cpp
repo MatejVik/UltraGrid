@@ -50,6 +50,7 @@
 #endif
 
 #include <cstdlib>
+#include <vector>
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wcast-align"
 #pragma GCC diagnostic ignored "-Wcast-qual"
@@ -247,6 +248,134 @@ resize_i420_frame(char *indata, char *outdata, int width, int height,
     resize(in_u, out_u, out_u.size(), 0, 0, resize_spec->algo);
     resize(in_v, out_v, out_v.size(), 0, 0, resize_spec->algo);
     DEBUG_TIMER_STOP(resize);
+}
+
+static void
+get_resize_target_size(int width, int height, const struct resize_param *resize_spec,
+                       int *target_width, int *target_height)
+{
+    if (resize_spec->mode == resize_param::USE_FRACTION) {
+        *target_width = width * resize_spec->factor;
+        *target_height = height * resize_spec->factor;
+    } else if (resize_spec->mode == resize_param::USE_DIMENSIONS) {
+        *target_width = resize_spec->target_width;
+        *target_height = resize_spec->target_height;
+    } else {
+        abort();
+    }
+}
+
+static void
+unpack_packed422(const char *indata, codec_t in_color, int width, int height,
+                 unsigned char *y, unsigned char *u, unsigned char *v)
+{
+    const unsigned char *src = reinterpret_cast<const unsigned char *>(indata);
+    const int chroma_width = width / 2;
+    const int in_linesize = vc_get_linesize(width, in_color);
+
+    for (int row = 0; row < height; ++row) {
+        const unsigned char *src_row = src + row * in_linesize;
+        unsigned char *y_row = y + row * width;
+        unsigned char *u_row = u + row * chroma_width;
+        unsigned char *v_row = v + row * chroma_width;
+
+        for (int pair = 0; pair < chroma_width; ++pair) {
+            const unsigned char *p = src_row + pair * 4;
+            if (in_color == UYVY) {
+                u_row[pair] = p[0];
+                y_row[pair * 2] = p[1];
+                v_row[pair] = p[2];
+                y_row[pair * 2 + 1] = p[3];
+            } else {
+                y_row[pair * 2] = p[0];
+                u_row[pair] = p[1];
+                y_row[pair * 2 + 1] = p[2];
+                v_row[pair] = p[3];
+            }
+        }
+    }
+}
+
+static void
+pack_packed422(const unsigned char *y, const unsigned char *u,
+               const unsigned char *v, codec_t out_color, char *outdata,
+               int width, int height)
+{
+    unsigned char *dst = reinterpret_cast<unsigned char *>(outdata);
+    const int chroma_width = width / 2;
+    const int out_linesize = vc_get_linesize(width, out_color);
+
+    for (int row = 0; row < height; ++row) {
+        unsigned char *dst_row = dst + row * out_linesize;
+        const unsigned char *y_row = y + row * width;
+        const unsigned char *u_row = u + row * chroma_width;
+        const unsigned char *v_row = v + row * chroma_width;
+
+        for (int pair = 0; pair < chroma_width; ++pair) {
+            unsigned char *p = dst_row + pair * 4;
+            if (out_color == UYVY) {
+                p[0] = u_row[pair];
+                p[1] = y_row[pair * 2];
+                p[2] = v_row[pair];
+                p[3] = y_row[pair * 2 + 1];
+            } else {
+                p[0] = y_row[pair * 2];
+                p[1] = u_row[pair];
+                p[2] = y_row[pair * 2 + 1];
+                p[3] = v_row[pair];
+            }
+        }
+    }
+}
+
+void
+resize_packed422_frame(char *indata, codec_t in_color, char *outdata,
+                       int width, int height, struct resize_param *resize_spec)
+{
+    if (resize_spec->algo == RESIZE_ALGO_DFL) {
+        resize_spec->algo = resize_algo_get_default();
+        MSG(NOTICE, "using resize algorithm: %s\n",
+          resize_algo_to_string(resize_spec->algo));
+    }
+
+    int target_width = 0;
+    int target_height = 0;
+    get_resize_target_size(width, height, resize_spec, &target_width,
+                           &target_height);
+
+    if (width % 2 != 0 || target_width % 2 != 0) {
+        LOG(LOG_LEVEL_ERROR) << MOD_NAME "Packed 4:2:2 resize requires even "
+                             << "input and output widths.\n";
+        abort();
+    }
+
+    const int chroma_width = width / 2;
+    const int target_chroma_width = target_width / 2;
+    std::vector<unsigned char> in_y(width * height);
+    std::vector<unsigned char> in_u(chroma_width * height);
+    std::vector<unsigned char> in_v(chroma_width * height);
+    std::vector<unsigned char> out_y(target_width * target_height);
+    std::vector<unsigned char> out_u(target_chroma_width * target_height);
+    std::vector<unsigned char> out_v(target_chroma_width * target_height);
+
+    unpack_packed422(indata, in_color, width, height, in_y.data(), in_u.data(),
+                     in_v.data());
+
+    Mat in_y_mat(height, width, CV_8UC1, in_y.data());
+    Mat in_u_mat(height, chroma_width, CV_8UC1, in_u.data());
+    Mat in_v_mat(height, chroma_width, CV_8UC1, in_v.data());
+    Mat out_y_mat(target_height, target_width, CV_8UC1, out_y.data());
+    Mat out_u_mat(target_height, target_chroma_width, CV_8UC1, out_u.data());
+    Mat out_v_mat(target_height, target_chroma_width, CV_8UC1, out_v.data());
+
+    DEBUG_TIMER_START(resize);
+    resize(in_y_mat, out_y_mat, out_y_mat.size(), 0, 0, resize_spec->algo);
+    resize(in_u_mat, out_u_mat, out_u_mat.size(), 0, 0, resize_spec->algo);
+    resize(in_v_mat, out_v_mat, out_v_mat.size(), 0, 0, resize_spec->algo);
+    DEBUG_TIMER_STOP(resize);
+
+    pack_packed422(out_y.data(), out_u.data(), out_v.data(), in_color, outdata,
+                   target_width, target_height);
 }
 
 static const struct {

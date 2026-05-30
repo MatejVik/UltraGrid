@@ -77,6 +77,7 @@ struct state_resize {
     decoder_t decoder;
     struct video_frame *dec_frame;
     bool use_i420_path;
+    bool use_packed_422_path;
 };
 
 static void usage() {
@@ -193,6 +194,7 @@ reconfigure_if_needed(struct state_resize *s, const struct video_frame *in)
     struct video_desc dec_desc         = video_desc_from_frame(in);
     s->out_desc                        = video_desc_from_frame(in);
     s->use_i420_path                   = false;
+    s->use_packed_422_path             = false;
     const codec_t supp_in_codecs[] = { RESIZE_SUPPORTED_PIXFMT_INIT,
                                            VIDEO_CODEC_NONE };
     if (codec_is_in_set(in->color_spec, supp_in_codecs)) {
@@ -223,17 +225,33 @@ reconfigure_if_needed(struct state_resize *s, const struct video_frame *in)
         dec_desc.height % 2 == 0 &&
         s->out_desc.width % 2 == 0 &&
         s->out_desc.height % 2 == 0;
+    const bool packed_422_input =
+        (in->color_spec == UYVY || in->color_spec == YUYV) &&
+        s->decoder == vc_memcpy;
     if (i420_even_size) {
         s->out_desc.color_spec = I420;
         s->use_i420_path = true;
         MSG(NOTICE, "using planar I420 resize path\n");
+    } else if (packed_422_input) {
+        if (dec_desc.width % 2 != 0 || s->out_desc.width % 2 != 0) {
+            MSG(ERROR, "Direct packed 4:2:2 resize for %s requires even "
+                       "input and output widths.\n",
+                get_codec_name(in->color_spec));
+            return false;
+        }
+        s->out_desc.color_spec = in->color_spec;
+        s->use_packed_422_path = true;
+        MSG(NOTICE, "using direct packed 4:2:2 resize path: %s -> %s\n",
+            get_codec_name(in->color_spec), get_codec_name(s->out_desc.color_spec));
     } else {
         s->out_desc.color_spec =
             get_bits_per_component(dec_desc.color_spec) == DEPTH8 ? RGB : RG48;
     }
-    MSG(INFO, "Decoding through %s to output pixfmt %s.\n",
-        get_codec_name(dec_desc.color_spec),
-        get_codec_name(s->out_desc.color_spec));
+    if (!s->use_packed_422_path) {
+        MSG(INFO, "Decoding through %s to output pixfmt %s.\n",
+            get_codec_name(dec_desc.color_spec),
+            get_codec_name(s->out_desc.color_spec));
+    }
 
     s->saved_desc = video_desc_from_frame(in);
     cleanup_common(s);
@@ -285,6 +303,11 @@ static struct video_frame *filter(void *state, struct video_frame *in)
             resize_i420_frame(in_frame->tiles[i].data, out_frame->tiles[i].data,
                               (int) in_frame->tiles[i].width,
                               (int) in_frame->tiles[i].height, &s->param);
+        } else if (s->use_packed_422_path) {
+            resize_packed422_frame(in_frame->tiles[i].data, in_frame->color_spec,
+                                   out_frame->tiles[i].data,
+                                   (int) in_frame->tiles[i].width,
+                                   (int) in_frame->tiles[i].height, &s->param);
         } else {
             resize_frame(in_frame->tiles[i].data, in_frame->color_spec,
                          out_frame->tiles[i].data,

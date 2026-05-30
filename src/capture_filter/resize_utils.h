@@ -81,6 +81,9 @@ void resize_frame(char *indata, codec_t in_color, char *outdata, int width,
                   int height, struct resize_param *resize_spec);
 void resize_i420_frame(char *indata, char *outdata, int width, int height,
                        struct resize_param *resize_spec);
+void resize_packed422_frame(char *indata, codec_t in_color, char *outdata,
+                            int width, int height,
+                            struct resize_param *resize_spec);
 
 #ifdef __cplusplus
 }
