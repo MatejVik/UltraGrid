@@ -43,7 +43,6 @@
 #include <stdlib.h>          // for NULL, free, malloc, size_t
 #include <string.h>          // for memcpy, strcmp
 
-#include "capture_filter/vo_pp_wrapper.h" // for ADD_CAPTURE_FILTER_VO_PP_W...
 #include "compat/c23.h"      // IWYU pragma: keep
 #include "debug.h"
 #include "lib_common.h"
@@ -221,7 +220,3 @@ static const struct vo_postprocess_info vo_pp_interlace_info = {
 };
 
 REGISTER_MODULE(interlace, &vo_pp_interlace_info, LIBRARY_CLASS_VIDEO_POSTPROCESS, VO_PP_ABI_VERSION);
-
-ADD_CAPTURE_FILTER_VO_PP_WRAPPER(interlace, interlace_init,
-                                 interlace_reconfigure, interlace_get_out_desc,
-                                 interlace_postprocess, interlace_done);

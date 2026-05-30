@@ -3691,6 +3691,7 @@ if test "$build_default" != no || test "$req_files" = all; then
         src/capture_filter/flip.o
         src/capture_filter/gamma.o
         src/capture_filter/grayscale.o
+        src/capture_filter/interlace.o
         src/capture_filter/logo.o
         src/capture_filter/matrix.o
         src/capture_filter/matrix2.o
