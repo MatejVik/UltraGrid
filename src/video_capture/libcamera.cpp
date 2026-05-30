@@ -98,8 +98,10 @@ struct libcamera_options {
         size_t camera_index = 0;
         libcamera::Size size = {};
         unsigned int fps = 0;
+        double output_fps = 0.0;
         bool size_set = false;
         bool fps_set = false;
+        bool field_weave = false;
         bool format_set = false;
         std::string format_name = "YUV420";
         libcamera::PixelFormat pixel_format = libcamera::formats::YUV420;
@@ -145,6 +147,17 @@ bool is_format_available(
 bool is_packed_422(codec_t codec)
 {
         return codec == UYVY || codec == YUYV;
+}
+
+void weave_packed_422_fields(char *dst, const char *first,
+                const char *second, unsigned int width, unsigned int height,
+                codec_t codec)
+{
+        const size_t row_bytes = vc_get_linesize(width, codec);
+        for (unsigned int y = 0; y < height; ++y) {
+                const char *src = y % 2 == 0 ? first : second;
+                memcpy(dst + y * row_bytes, src + y * row_bytes, row_bytes);
+        }
 }
 
 void log_stream_config(const char *label,
@@ -232,6 +245,13 @@ struct vidcap_libcamera_state {
         bool camera_acquired = false;
         bool stopping = false;
         unsigned int copied_frames = 0;
+        bool field_weave = false;
+        std::vector<char> field_weave_current_frame;
+        std::vector<char> field_weave_prev_frame;
+        bool field_weave_have_prev = false;
+        uint64_t field_weave_prev_timestamp = 0;
+        unsigned int field_weave_prev_sequence = 0;
+        unsigned int field_weave_disruption_warnings = 0;
 
         void request_completed(libcamera::Request *request)
         {
@@ -268,6 +288,18 @@ void unmap_mapped_buffer(mapped_buffer *mapped)
                 }
         }
         mapped->planes.clear();
+}
+
+void warn_field_weave_disrupted(vidcap_libcamera_state *s, const char *reason)
+{
+        if (s->field_weave_disruption_warnings < 3) {
+                log_msg(LOG_LEVEL_WARNING,
+                                MOD_NAME "field-weave frame-pair sequencing "
+                                "disrupted: %s; dropping stored field\n",
+                                reason);
+                s->field_weave_disruption_warnings += 1;
+        }
+        s->field_weave_have_prev = false;
 }
 
 void vidcap_libcamera_cleanup(vidcap_libcamera_state *s)
@@ -314,6 +346,9 @@ void vidcap_libcamera_cleanup(vidcap_libcamera_state *s)
 
         vf_free(s->frame);
         s->frame = nullptr;
+        s->field_weave_current_frame.clear();
+        s->field_weave_prev_frame.clear();
+        s->field_weave_have_prev = false;
         delete s;
 }
 
@@ -496,7 +531,7 @@ void print_usage()
 {
         printf("libcamera capture\n");
         printf("Usage:\n");
-        printf("\t-t libcamera[:d=<index>|camera=<index>][:size=WxH][:fps=N][:format=YUV420|I420|UYVY|YUYV][:list|caps|test|help|fullhelp]\n");
+        printf("\t-t libcamera[:d=<index>|camera=<index>][:size=WxH][:fps=N|Ni][:format=YUV420|I420|UYVY|YUYV][:list|caps|test|help|fullhelp]\n");
         printf("\n");
 }
 
@@ -506,7 +541,9 @@ void show_fullhelp()
         printf("Without overrides, libcamera's default VideoRecording configuration is used.\n");
         printf("d=<index>, camera=<index> select a libcamera device; both names are aliases.\n");
         printf("size=WxH selects the output stream size.\n");
-        printf("fps=N requests frame rate through FrameDurationLimits when streaming starts.\n");
+        printf("fps=N requests progressive frame rate through FrameDurationLimits when streaming starts.\n");
+        printf("fps=Ni captures progressive N fps and field-weaves pairs into N/2 interlaced frames/s with INTERLACED_MERGED metadata.\n");
+        printf("fps=Ni is experimental and currently supported only with native UYVY/YUYV; YUV420/I420 4:2:0 chroma field-weave is intentionally not implemented yet.\n");
         printf("format=YUV420 selects planar 4:2:0 and maps to UltraGrid I420. I420 is an alias.\n");
         printf("format=UYVY and format=YUYV select packed 8-bit 4:2:2 handoff if libcamera can negotiate them natively.\n");
         printf("format=YUV422 is recognized but rejected because this UltraGrid tree has no direct matching internal planar 8-bit 4:2:2 codec mapping.\n");
@@ -531,12 +568,14 @@ void show_help_header()
         printf("\t-t libcamera\n");
         printf("\t-t libcamera:d=0:size=1280x720:fps=50:format=YUV420\n");
         printf("\t-t libcamera:d=0:size=1280x720:fps=50:format=UYVY\n");
+        printf("\t-t libcamera:d=0:size=1280x720:fps=50i:format=UYVY\n");
         printf("\t-t libcamera:list\n");
         printf("\t-t libcamera:caps\n");
         printf("\t-t libcamera:d=0:size=1280x720:format=YUV420:test\n");
         printf("\n");
         printf("Default uses libcamera's VideoRecording configuration.\n");
         printf("Supported output formats: YUV420/I420; UYVY/YUYV if negotiated natively.\n");
+        printf("Field-weave: fps=Ni with UYVY/YUYV only.\n");
         printf("YUV422/YUV444 are recognized but rejected: no direct internal planar 8-bit codec mapping in this UltraGrid tree.\n");
         printf("test: measured FPS support test.\n");
         printf("Use -t libcamera:fullhelp for parameter details and -t libcamera:caps for full capabilities.\n");
@@ -596,12 +635,27 @@ int parse_fmt(std::string_view fmt, libcamera_options *opts)
                                         "size/fps/format\n");
                         return VIDCAP_INIT_FAIL;
                 } else if (key == "fps") {
-                        if (!parse_num(val, opts->fps) || opts->fps == 0) {
+                        bool field_weave = false;
+                        if (!val.empty() &&
+                                        (val.back() == 'i' ||
+                                                val.back() == 'I')) {
+                                field_weave = true;
+                                val.remove_suffix(1);
+                        }
+                        if (val.empty() ||
+                                        val.find_first_not_of("0123456789") !=
+                                                std::string_view::npos ||
+                                        !parse_num(val, opts->fps) ||
+                                        opts->fps == 0) {
                                 log_msg(LOG_LEVEL_ERROR,
                                                 MOD_NAME "failed to parse fps\n");
                                 return VIDCAP_INIT_FAIL;
                         }
                         opts->fps_set = true;
+                        opts->field_weave = field_weave;
+                        opts->output_fps = field_weave ?
+                                static_cast<double>(opts->fps) / 2.0 :
+                                static_cast<double>(opts->fps);
                 } else if (key == "format") {
                         const libcamera_format_mapping *mapping =
                                 find_supported_format(val);
@@ -647,6 +701,20 @@ int parse_fmt(std::string_view fmt, libcamera_options *opts)
                 }
         }
 
+        return VIDCAP_INIT_OK;
+}
+
+int validate_options(const libcamera_options &opts)
+{
+        if (opts.field_weave && !is_packed_422(opts.codec)) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "fps=%ui field-weave is supported "
+                                "only with native UYVY/YUYV; YUV420/I420 "
+                                "4:2:0 chroma field-weave is intentionally "
+                                "not implemented yet\n",
+                                opts.fps);
+                return VIDCAP_INIT_FAIL;
+        }
         return VIDCAP_INIT_OK;
 }
 
@@ -859,9 +927,10 @@ bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
         }
         if (opts.fps_set) {
                 log_msg(LOG_LEVEL_INFO,
-                                MOD_NAME "requested fps=%u; will apply during "
-                                "camera start if supported\n",
-                                opts.fps);
+                                MOD_NAME "requested capture fps=%u%s; will "
+                                "apply during camera start if supported\n",
+                                opts.fps,
+                                opts.field_weave ? " for field-weave" : "");
         }
 
         libcamera::CameraConfiguration::Status status = config->validate();
@@ -963,20 +1032,23 @@ bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
         }
 
         const double configured_fps =
-                opts.fps_set ? static_cast<double>(opts.fps) : 0.0;
+                opts.fps_set ? opts.output_fps : 0.0;
+        const interlacing_t configured_interlacing =
+                opts.field_weave ? INTERLACED_MERGED : PROGRESSIVE;
         log_msg(LOG_LEVEL_INFO,
                         MOD_NAME "selected UltraGrid codec=%s size=%ux%u "
-                        "fps=%.2f%s\n",
+                        "fps=%.2f%s interlacing=%s\n",
                         get_codec_name(opts.codec), width, height,
                         configured_fps,
-                        opts.fps_set ? "" : " (unspecified)");
+                        opts.fps_set ? "" : " (unspecified)",
+                        get_interlacing_description(configured_interlacing));
 
         s->desc = {
                 width,
                 height,
                 opts.codec,
                 configured_fps,
-                PROGRESSIVE,
+                configured_interlacing,
                 1,
         };
         s->frame = vf_alloc_desc_data(s->desc);
@@ -984,6 +1056,20 @@ bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
                 log_msg(LOG_LEVEL_ERROR,
                                 MOD_NAME "failed to allocate UltraGrid frame\n");
                 return false;
+        }
+        s->field_weave = opts.field_weave;
+        if (s->field_weave) {
+                s->field_weave_current_frame.resize(
+                                s->frame->tiles[0].data_len);
+                s->field_weave_prev_frame.resize(s->frame->tiles[0].data_len);
+                log_msg(LOG_LEVEL_INFO,
+                                MOD_NAME "field-weave enabled: capture "
+                                "%ux%up%u -> output %ux%ui%u; output desc "
+                                "fps %.2f, interlacing %s\n",
+                                width, height, opts.fps, width, height,
+                                opts.fps, s->desc.fps,
+                                get_interlacing_description(
+                                        s->desc.interlacing));
         }
 
         s->allocator = std::make_unique<libcamera::FrameBufferAllocator>(
@@ -996,8 +1082,9 @@ bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
         }
 
         log_msg(LOG_LEVEL_INFO,
-                        MOD_NAME "libcamera capture started: %ux%u %s\n",
-                        width, height, get_codec_name(opts.codec));
+                        MOD_NAME "libcamera capture started: %ux%u %s %s\n",
+                        width, height, get_codec_name(opts.codec),
+                        get_interlacing_suffix(s->desc.interlacing));
         return true;
 }
 
@@ -1553,6 +1640,9 @@ int vidcap_libcamera_init(const struct vidcap_params *params, void **state)
                         return ret;
                 }
         }
+        if (int ret = validate_options(opts); ret != VIDCAP_INIT_OK) {
+                return ret;
+        }
 
         *state = nullptr;
 
@@ -1663,6 +1753,11 @@ struct video_frame *vidcap_libcamera_grab(void *state,
                         log_msg(LOG_LEVEL_ERROR,
                                         MOD_NAME "completed request has no "
                                         "buffer for stream\n");
+                        if (s->field_weave && s->field_weave_have_prev) {
+                                warn_field_weave_disrupted(s,
+                                                "completed request had no "
+                                                "buffer");
+                        }
                 } else {
                         const unsigned int width = s->stream_config.size.width;
                         const unsigned int height = s->stream_config.size.height;
@@ -1679,6 +1774,12 @@ struct video_frame *vidcap_libcamera_grab(void *state,
                                 log_msg(LOG_LEVEL_ERROR, MOD_NAME
                                                 "unexpected mapped buffer, "
                                                 "skipping frame\n");
+                                if (s->field_weave &&
+                                                s->field_weave_have_prev) {
+                                        warn_field_weave_disrupted(s,
+                                                        "unexpected mapped "
+                                                        "buffer");
+                                }
                         } else {
                                 char *dst = s->frame->tiles[0].data;
                                 const mapped_buffer &mapped = mapped_it->second;
@@ -1745,6 +1846,9 @@ struct video_frame *vidcap_libcamera_grab(void *state,
                                         const char *copy_mode =
                                                 src_stride == row_bytes ?
                                                 "contiguous" : "row-by-row";
+                                        char *packed_dst = s->field_weave ?
+                                                s->field_weave_current_frame.data() :
+                                                dst;
                                         if (planes.size() != 1 ||
                                                         metadata_planes.empty() ||
                                                         mapped.planes.size() != 1 ||
@@ -1760,14 +1864,14 @@ struct video_frame *vidcap_libcamera_grab(void *state,
                                                                 get_codec_name(codec));
                                         } else {
                                                 if (src_stride == row_bytes) {
-                                                        memcpy(dst,
+                                                        memcpy(packed_dst,
                                                                         mapped.planes[0].data,
                                                                         frame_size);
                                                 } else {
                                                         for (unsigned int y = 0;
                                                                         y < height;
                                                                         ++y) {
-                                                                memcpy(dst + y * row_bytes,
+                                                                memcpy(packed_dst + y * row_bytes,
                                                                                 mapped.planes[0].data + y * src_stride,
                                                                                 row_bytes);
                                                         }
@@ -1793,10 +1897,73 @@ struct video_frame *vidcap_libcamera_grab(void *state,
                                         }
                                 }
                                 if (copied) {
+                                        if (s->field_weave) {
+                                                if (!s->field_weave_have_prev) {
+                                                        s->field_weave_prev_frame =
+                                                                s->field_weave_current_frame;
+                                                        s->field_weave_prev_timestamp =
+                                                                buffer->metadata().timestamp;
+                                                        s->field_weave_prev_sequence =
+                                                                buffer->metadata().sequence;
+                                                        s->field_weave_have_prev = true;
+
+                                                        request->reuse(
+                                                                        libcamera::Request::ReuseBuffers);
+                                                        int queue_ret =
+                                                                s->camera->queueRequest(request);
+                                                        if (queue_ret != 0) {
+                                                                log_msg(LOG_LEVEL_ERROR,
+                                                                                MOD_NAME
+                                                                                "failed to "
+                                                                                "requeue "
+                                                                                "request: %d\n",
+                                                                                queue_ret);
+                                                        }
+                                                        return nullptr;
+                                                }
+                                                if (buffer->metadata().sequence !=
+                                                                s->field_weave_prev_sequence + 1) {
+                                                        warn_field_weave_disrupted(s,
+                                                                        "non-consecutive "
+                                                                        "libcamera "
+                                                                        "sequence");
+                                                        s->field_weave_prev_frame =
+                                                                s->field_weave_current_frame;
+                                                        s->field_weave_prev_timestamp =
+                                                                buffer->metadata().timestamp;
+                                                        s->field_weave_prev_sequence =
+                                                                buffer->metadata().sequence;
+                                                        s->field_weave_have_prev = true;
+
+                                                        request->reuse(
+                                                                        libcamera::Request::ReuseBuffers);
+                                                        int queue_ret =
+                                                                s->camera->queueRequest(request);
+                                                        if (queue_ret != 0) {
+                                                                log_msg(LOG_LEVEL_ERROR,
+                                                                                MOD_NAME
+                                                                                "failed to "
+                                                                                "requeue "
+                                                                                "request: %d\n",
+                                                                                queue_ret);
+                                                        }
+                                                        return nullptr;
+                                                }
+                                                weave_packed_422_fields(dst,
+                                                                s->field_weave_prev_frame.data(),
+                                                                s->field_weave_current_frame.data(),
+                                                                width, height,
+                                                                codec);
+                                                s->field_weave_have_prev = false;
+                                                s->frame->timestamp =
+                                                        s->field_weave_prev_timestamp *
+                                                        90 / 1000000;
+                                        } else {
+                                                s->frame->timestamp =
+                                                        buffer->metadata().timestamp *
+                                                        90 / 1000000;
+                                        }
                                         s->frame->tiles[0].data_len = frame_size;
-                                        s->frame->timestamp =
-                                                buffer->metadata().timestamp *
-                                                90 / 1000000;
                                         s->copied_frames += 1;
 
                                         request->reuse(
@@ -1812,6 +1979,11 @@ struct video_frame *vidcap_libcamera_grab(void *state,
                                                                 queue_ret);
                                         }
                                         return s->frame;
+                                } else if (s->field_weave &&
+                                                s->field_weave_have_prev) {
+                                        warn_field_weave_disrupted(s,
+                                                        "failed to copy "
+                                                        "current frame");
                                 }
                         }
                 }
