@@ -81,8 +81,6 @@ using cv::Mat;
 using cv::Rect;
 using cv::Size;
 
-static const char *resize_algo_to_string(int algo);
-
 static Mat ug_to_rgb_mat(codec_t codec, int width, int height, char *indata) {
     Mat yuv;
     Mat rgb;
@@ -186,9 +184,9 @@ resize_frame(char *indata, codec_t in_color, char *outdata, int width,
              int height, struct resize_param *resize_spec)
 {
     if (resize_spec->algo == RESIZE_ALGO_DFL) {
-        resize_spec->algo = DEFAULT_ALGO;
+        resize_spec->algo = resize_algo_get_default();
         MSG(NOTICE, "using resize algorithm: %s\n",
-          resize_algo_to_string(DEFAULT_ALGO));
+          resize_algo_to_string(resize_spec->algo));
     }
 
     DEBUG_TIMER_START(resize);
@@ -205,6 +203,49 @@ resize_frame(char *indata, codec_t in_color, char *outdata, int width,
     } else {
         abort();
     }
+    DEBUG_TIMER_STOP(resize);
+}
+
+void
+resize_i420_frame(char *indata, char *outdata, int width, int height,
+                  struct resize_param *resize_spec)
+{
+    if (resize_spec->algo == RESIZE_ALGO_DFL) {
+        resize_spec->algo = resize_algo_get_default();
+        MSG(NOTICE, "using resize algorithm: %s\n",
+          resize_algo_to_string(resize_spec->algo));
+    }
+
+    int target_width = 0;
+    int target_height = 0;
+    if (resize_spec->mode == resize_param::USE_FRACTION) {
+        target_width = width * resize_spec->factor;
+        target_height = height * resize_spec->factor;
+    } else if (resize_spec->mode == resize_param::USE_DIMENSIONS) {
+        target_width = resize_spec->target_width;
+        target_height = resize_spec->target_height;
+    } else {
+        abort();
+    }
+
+    const size_t in_y_size = width * height;
+    const size_t out_y_size = target_width * target_height;
+
+    Mat in_y(height, width, CV_8UC1, indata);
+    Mat in_u(height / 2, width / 2, CV_8UC1, indata + in_y_size);
+    Mat in_v(height / 2, width / 2, CV_8UC1,
+             indata + in_y_size + in_y_size / 4);
+
+    Mat out_y(target_height, target_width, CV_8UC1, outdata);
+    Mat out_u(target_height / 2, target_width / 2, CV_8UC1,
+              outdata + out_y_size);
+    Mat out_v(target_height / 2, target_width / 2, CV_8UC1,
+              outdata + out_y_size + out_y_size / 4);
+
+    DEBUG_TIMER_START(resize);
+    resize(in_y, out_y, out_y.size(), 0, 0, resize_spec->algo);
+    resize(in_u, out_u, out_u.size(), 0, 0, resize_spec->algo);
+    resize(in_v, out_v, out_v.size(), 0, 0, resize_spec->algo);
     DEBUG_TIMER_STOP(resize);
 }
 
@@ -240,7 +281,13 @@ resize_algo_from_string(const char *str)
     return RESIZE_ALGO_UNKN;
 }
 
-static const char *
+int
+resize_algo_get_default(void)
+{
+    return DEFAULT_ALGO;
+}
+
+const char *
 resize_algo_to_string(int algo)
 {
     for (auto const &i : interp_map) {
