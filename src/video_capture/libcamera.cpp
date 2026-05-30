@@ -43,6 +43,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <strings.h>
 #include <deque>
 #include <map>
 #include <memory>
@@ -99,9 +100,52 @@ struct libcamera_options {
         unsigned int fps = 0;
         bool size_set = false;
         bool fps_set = false;
-        bool format_yuv420 = false;
+        bool format_set = false;
+        std::string format_name = "YUV420";
+        libcamera::PixelFormat pixel_format = libcamera::formats::YUV420;
+        codec_t codec = I420;
         bool test_verbose = false;
 };
+
+struct libcamera_format_mapping {
+        const char *name;
+        libcamera::PixelFormat pixel_format;
+        codec_t codec;
+};
+
+const libcamera_format_mapping supported_formats[] = {
+        { "YUV420", libcamera::formats::YUV420, I420 },
+        { "I420", libcamera::formats::YUV420, I420 },
+        { "UYVY", libcamera::formats::UYVY, UYVY },
+        { "YUYV", libcamera::formats::YUYV, YUYV },
+};
+
+const libcamera_format_mapping *find_supported_format(std::string_view name)
+{
+        for (const libcamera_format_mapping &mapping : supported_formats) {
+                if (name.size() == strlen(mapping.name) &&
+                                strncasecmp(name.data(), mapping.name,
+                                        name.size()) == 0) {
+                        return &mapping;
+                }
+        }
+        return nullptr;
+}
+
+bool is_format_available(
+                const libcamera::StreamConfiguration &stream_config,
+                const libcamera::PixelFormat &pixel_format)
+{
+        const std::vector<libcamera::PixelFormat> formats =
+                stream_config.formats().pixelformats();
+        return std::find(formats.begin(), formats.end(), pixel_format) !=
+                formats.end();
+}
+
+bool is_packed_422(codec_t codec)
+{
+        return codec == UYVY || codec == YUYV;
+}
 
 void log_stream_config(const char *label,
                 const libcamera::StreamConfiguration &stream_config)
@@ -452,7 +496,7 @@ void print_usage()
 {
         printf("libcamera capture\n");
         printf("Usage:\n");
-        printf("\t-t libcamera[:d=<index>|camera=<index>][:size=WxH][:fps=N][:format=YUV420][:list|caps|test|help|fullhelp]\n");
+        printf("\t-t libcamera[:d=<index>|camera=<index>][:size=WxH][:fps=N][:format=YUV420|I420|UYVY|YUYV][:list|caps|test|help|fullhelp]\n");
         printf("\n");
 }
 
@@ -463,7 +507,10 @@ void show_fullhelp()
         printf("d=<index>, camera=<index> select a libcamera device; both names are aliases.\n");
         printf("size=WxH selects the output stream size.\n");
         printf("fps=N requests frame rate through FrameDurationLimits when streaming starts.\n");
-        printf("format=YUV420 selects the output pixel format. Other formats are not supported yet.\n");
+        printf("format=YUV420 selects planar 4:2:0 and maps to UltraGrid I420. I420 is an alias.\n");
+        printf("format=UYVY and format=YUYV select packed 8-bit 4:2:2 handoff if libcamera can negotiate them natively.\n");
+        printf("format=YUV422 is recognized but rejected because this UltraGrid tree has no direct matching internal planar 8-bit 4:2:2 codec mapping.\n");
+        printf("format=YUV444 is recognized but rejected because this UltraGrid tree has no direct matching internal planar 8-bit 4:4:4 codec mapping.\n");
         printf("list prints only available cameras.\n");
         printf("caps prints detailed libcamera StreamFormats and may be long.\n");
         printf("test runs a short measured FPS support test for typical values 24..120.\n");
@@ -473,8 +520,8 @@ void show_fullhelp()
         printf("help prints a compact device and output-size overview.\n");
         printf("fullhelp prints this detailed parameter description.\n");
         printf("mode=N is intentionally not part of the public libcamera API because libcamera/RPi sensor modes are a different layer than VideoRecording output.\n");
-        printf("The currently supported output format for future frame handoff is YUV420.\n");
-        printf("Status: YUV420 capture handoff is implemented.\n");
+        printf("Supported output formats for native frame handoff: YUV420/I420, UYVY, YUYV.\n");
+        printf("Status: progressive YUV capture handoff is implemented.\n");
 }
 
 void show_help_header()
@@ -483,12 +530,14 @@ void show_help_header()
         printf("Examples:\n");
         printf("\t-t libcamera\n");
         printf("\t-t libcamera:d=0:size=1280x720:fps=50:format=YUV420\n");
+        printf("\t-t libcamera:d=0:size=1280x720:fps=50:format=UYVY\n");
         printf("\t-t libcamera:list\n");
         printf("\t-t libcamera:caps\n");
         printf("\t-t libcamera:d=0:size=1280x720:format=YUV420:test\n");
         printf("\n");
         printf("Default uses libcamera's VideoRecording configuration.\n");
-        printf("Supported output format for future frame handoff: YUV420.\n");
+        printf("Supported output formats: YUV420/I420; UYVY/YUYV if negotiated natively.\n");
+        printf("YUV422/YUV444 are recognized but rejected: no direct internal planar 8-bit codec mapping in this UltraGrid tree.\n");
         printf("test: measured FPS support test.\n");
         printf("Use -t libcamera:fullhelp for parameter details and -t libcamera:caps for full capabilities.\n");
         printf("\n");
@@ -554,11 +603,41 @@ int parse_fmt(std::string_view fmt, libcamera_options *opts)
                         }
                         opts->fps_set = true;
                 } else if (key == "format") {
-                        if (val == "YUV420") {
-                                opts->format_yuv420 = true;
+                        const libcamera_format_mapping *mapping =
+                                find_supported_format(val);
+                        if (mapping != nullptr) {
+                                opts->format_set = true;
+                                opts->format_name = mapping->name;
+                                opts->pixel_format = mapping->pixel_format;
+                                opts->codec = mapping->codec;
+                        } else if (val.size() == strlen("YUV422") &&
+                                        strncasecmp(val.data(), "YUV422",
+                                                val.size()) == 0) {
+                                log_msg(LOG_LEVEL_ERROR,
+                                                MOD_NAME "format=YUV422 is "
+                                                "unsupported: this UltraGrid "
+                                                "tree has no "
+                                                "direct matching internal "
+                                                "planar 8-bit 4:2:2 codec "
+                                                "mapping\n");
+                                return VIDCAP_INIT_FAIL;
+                        } else if (val.size() == strlen("YUV444") &&
+                                        strncasecmp(val.data(), "YUV444",
+                                                val.size()) == 0) {
+                                log_msg(LOG_LEVEL_ERROR,
+                                                MOD_NAME "format=YUV444 is "
+                                                "unsupported: this UltraGrid "
+                                                "tree has no direct matching "
+                                                "internal planar 8-bit 4:4:4 "
+                                                "codec mapping\n");
+                                return VIDCAP_INIT_FAIL;
                         } else {
                                 log_msg(LOG_LEVEL_ERROR,
-                                                MOD_NAME "unsupported format\n");
+                                                MOD_NAME "unsupported format "
+                                                "%.*s; supported values are "
+                                                "YUV420, I420, UYVY, YUYV\n",
+                                                static_cast<int>(val.size()),
+                                                val.data());
                                 return VIDCAP_INIT_FAIL;
                         }
                 } else if (!key.empty()) {
@@ -733,24 +812,39 @@ bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
         libcamera::StreamConfiguration &stream_config = config->at(0);
         log_stream_config("generated stream", stream_config);
 
-        const libcamera::PixelFormat requested_pixfmt =
-                libcamera::formats::YUV420;
+        const libcamera::PixelFormat requested_pixfmt = opts.pixel_format;
         const libcamera::Size requested_size = opts.size;
         libcamera::Size effective_requested_size = requested_size;
-        bool check_requested_format = opts.format_yuv420;
+        bool check_requested_format = opts.format_set;
         bool check_requested_size = opts.size_set;
 
         if (opts.size_set) {
                 stream_config.size = requested_size;
         }
-        if (opts.format_yuv420) {
+        if (opts.format_set) {
+                if (!is_format_available(stream_config, requested_pixfmt)) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "format=%s (%s) is not "
+                                        "advertised by libcamera for this "
+                                        "stream; use -t libcamera:caps to list "
+                                        "available formats\n",
+                                        opts.format_name.c_str(),
+                                        requested_pixfmt.toString().c_str());
+                        return false;
+                }
                 stream_config.pixelFormat = requested_pixfmt;
         }
         if (stream_config.bufferCount < 4) {
                 stream_config.bufferCount = 4;
         }
 
-        if (opts.size_set || opts.format_yuv420 || opts.fps_set) {
+        log_msg(LOG_LEVEL_INFO,
+                        MOD_NAME "requested libcamera pixel format: %s "
+                        "(format=%s); UltraGrid codec selected: %s\n",
+                        requested_pixfmt.toString().c_str(),
+                        opts.format_name.c_str(), get_codec_name(opts.codec));
+
+        if (opts.size_set || opts.format_set || opts.fps_set) {
                 log_msg(LOG_LEVEL_INFO,
                                 MOD_NAME "requested overrides: size=%s "
                                 "format=%s fps=%s bufferCount=%u\n",
@@ -774,6 +868,10 @@ bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
         log_msg(LOG_LEVEL_INFO, MOD_NAME "configuration validation: %s\n",
                         validation_status_to_string(status));
         log_stream_config("validated stream", stream_config);
+        log_msg(LOG_LEVEL_INFO,
+                        MOD_NAME "negotiated libcamera pixel format after "
+                        "validate: %s\n",
+                        stream_config.pixelFormat.toString().c_str());
 
         if (status == libcamera::CameraConfiguration::Invalid) {
                 log_msg(LOG_LEVEL_ERROR,
@@ -781,16 +879,20 @@ bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
                 return false;
         }
         if (stream_config.pixelFormat != requested_pixfmt) {
-                log_msg(LOG_LEVEL_ERROR,
-                                MOD_NAME "only YUV420 is supported for "
-                                "UltraGrid handoff, got %s\n",
-                                stream_config.pixelFormat.toString().c_str());
-                return false;
-        }
-        if (check_requested_format && stream_config.pixelFormat != requested_pixfmt) {
-                log_msg(LOG_LEVEL_ERROR,
-                                MOD_NAME "requested YUV420 was adjusted to %s\n",
-                                stream_config.pixelFormat.toString().c_str());
+                if (check_requested_format) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "requested format %s (%s) was "
+                                        "adjusted by libcamera to %s\n",
+                                        opts.format_name.c_str(),
+                                        requested_pixfmt.toString().c_str(),
+                                        stream_config.pixelFormat.toString().c_str());
+                } else {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "default YUV420/I420 handoff "
+                                        "requires libcamera format %s, got %s\n",
+                                        requested_pixfmt.toString().c_str(),
+                                        stream_config.pixelFormat.toString().c_str());
+                }
                 return false;
         }
         if (check_requested_size && stream_config.size != effective_requested_size) {
@@ -809,6 +911,20 @@ bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
                 return false;
         }
         log_msg(LOG_LEVEL_INFO, MOD_NAME "camera configure succeeded\n");
+        log_stream_config("configured stream", stream_config);
+        log_msg(LOG_LEVEL_INFO,
+                        MOD_NAME "negotiated libcamera pixel format after "
+                        "configure: %s\n",
+                        stream_config.pixelFormat.toString().c_str());
+        if (stream_config.pixelFormat != requested_pixfmt) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "requested format %s (%s) was "
+                                "changed by libcamera configure to %s\n",
+                                opts.format_name.c_str(),
+                                requested_pixfmt.toString().c_str(),
+                                stream_config.pixelFormat.toString().c_str());
+                return false;
+        }
 
         s->stream = stream_config.stream();
         if (s->stream == nullptr) {
@@ -819,19 +935,47 @@ bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
 
         const unsigned int width = stream_config.size.width;
         const unsigned int height = stream_config.size.height;
-        if (stream_config.stride != width) {
+        const unsigned int expected_stride =
+                static_cast<unsigned int>(vc_get_linesize(width, opts.codec));
+        if (is_packed_422(opts.codec) &&
+                        stream_config.stride > expected_stride) {
+                log_msg(LOG_LEVEL_INFO,
+                                MOD_NAME "%s stride %u includes padding; "
+                                "packed copy mode: row-by-row to "
+                                "UltraGrid stride %u\n",
+                                get_codec_name(opts.codec),
+                                stream_config.stride, expected_stride);
+        } else if (is_packed_422(opts.codec)) {
+                log_msg(LOG_LEVEL_INFO,
+                                MOD_NAME "%s stride %u; packed copy mode: "
+                                "contiguous\n",
+                                get_codec_name(opts.codec),
+                                stream_config.stride);
+        } else if (stream_config.stride != expected_stride) {
                 log_msg(LOG_LEVEL_ERROR,
-                                MOD_NAME "unsupported YUV420 stride %u for "
-                                "width %u\n",
-                                stream_config.stride, width);
+                                MOD_NAME "unsupported %s stride %u for width "
+                                "%u; expected %u for direct UltraGrid %s "
+                                "handoff\n",
+                                opts.format_name.c_str(), stream_config.stride,
+                                width, expected_stride,
+                                get_codec_name(opts.codec));
                 return false;
         }
+
+        const double configured_fps =
+                opts.fps_set ? static_cast<double>(opts.fps) : 0.0;
+        log_msg(LOG_LEVEL_INFO,
+                        MOD_NAME "selected UltraGrid codec=%s size=%ux%u "
+                        "fps=%.2f%s\n",
+                        get_codec_name(opts.codec), width, height,
+                        configured_fps,
+                        opts.fps_set ? "" : " (unspecified)");
 
         s->desc = {
                 width,
                 height,
-                I420,
-                opts.fps_set ? static_cast<double>(opts.fps) : 0.0,
+                opts.codec,
+                configured_fps,
                 PROGRESSIVE,
                 1,
         };
@@ -852,8 +996,8 @@ bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
         }
 
         log_msg(LOG_LEVEL_INFO,
-                        MOD_NAME "libcamera capture started: %ux%u I420\n",
-                        width, height);
+                        MOD_NAME "libcamera capture started: %ux%u %s\n",
+                        width, height, get_codec_name(opts.codec));
         return true;
 }
 
@@ -963,7 +1107,12 @@ bool configure_test_stream(libcamera::Camera *camera,
         if (opts.size_set) {
                 stream_config.size = opts.size;
         }
-        stream_config.pixelFormat = libcamera::formats::YUV420;
+        if (!is_format_available(stream_config, opts.pixel_format)) {
+                *error = "requested format " + opts.format_name +
+                        " is not advertised by libcamera";
+                return false;
+        }
+        stream_config.pixelFormat = opts.pixel_format;
         if (stream_config.bufferCount < 4) {
                 stream_config.bufferCount = 4;
         }
@@ -973,8 +1122,9 @@ bool configure_test_stream(libcamera::Camera *camera,
                 *error = "configuration invalid";
                 return false;
         }
-        if (stream_config.pixelFormat != libcamera::formats::YUV420) {
-                *error = "YUV420 not supported for requested configuration";
+        if (stream_config.pixelFormat != opts.pixel_format) {
+                *error = "requested format " + opts.format_name +
+                        " adjusted to " + stream_config.pixelFormat.toString();
                 return false;
         }
         if (opts.size_set && stream_config.size != opts.size) {
@@ -1281,7 +1431,7 @@ int run_fps_test(const libcamera_options &opts)
 
         printf("libcamera FPS test\n");
         printf("Device %zu) %s\n", opts.camera_index, target.camera_id.c_str());
-        printf("Format: YUV420\n");
+        printf("Format: %s\n", opts.format_name.c_str());
         printf("Size: %s\n\n", target.size.toString().c_str());
         if (!opts.test_verbose) {
                 printf("Running tests...\n\n");
@@ -1516,65 +1666,153 @@ struct video_frame *vidcap_libcamera_grab(void *state,
                 } else {
                         const unsigned int width = s->stream_config.size.width;
                         const unsigned int height = s->stream_config.size.height;
-                        const size_t y_size = static_cast<size_t>(width) * height;
-                        const size_t chroma_size = y_size / 4;
-                        const size_t frame_size = y_size + 2 * chroma_size;
+                        const codec_t codec = s->desc.color_spec;
+                        const size_t frame_size =
+                                vc_get_datalen(width, height, codec);
                         const auto planes = buffer->planes();
                         const auto metadata_planes = buffer->metadata().planes();
                         auto mapped_it = s->mapped_buffers.find(buffer);
 
-                        if (planes.size() != 3 ||
-                                        metadata_planes.size() < 3 ||
-                                        mapped_it == s->mapped_buffers.end() ||
-                                        mapped_it->second.planes.size() != 3 ||
-                                        s->frame->tiles[0].data_len < frame_size ||
-                                        mapped_it->second.planes[0].len < y_size ||
-                                        mapped_it->second.planes[1].len < chroma_size ||
-                                        mapped_it->second.planes[2].len < chroma_size ||
-                                        metadata_planes[0].bytesused < y_size ||
-                                        metadata_planes[1].bytesused < chroma_size ||
-                                        metadata_planes[2].bytesused < chroma_size) {
-                                log_msg(LOG_LEVEL_ERROR,
-                                                MOD_NAME "unexpected YUV420 "
-                                                "buffer layout, skipping frame\n");
+                        if (mapped_it == s->mapped_buffers.end() ||
+                                        s->frame->tiles[0].data_len <
+                                                frame_size) {
+                                log_msg(LOG_LEVEL_ERROR, MOD_NAME
+                                                "unexpected mapped buffer, "
+                                                "skipping frame\n");
                         } else {
                                 char *dst = s->frame->tiles[0].data;
                                 const mapped_buffer &mapped = mapped_it->second;
                                 if (s->copied_frames == 0) {
                                         log_frame_buffer(*buffer);
                                 }
-                                memcpy(dst, mapped.planes[0].data, y_size);
-                                memcpy(dst + y_size, mapped.planes[1].data,
-                                                chroma_size);
-                                memcpy(dst + y_size + chroma_size,
-                                                mapped.planes[2].data,
-                                                chroma_size);
-                                s->frame->tiles[0].data_len = frame_size;
-                                s->frame->timestamp =
-                                        buffer->metadata().timestamp * 90 / 1000000;
-                                if (s->copied_frames < 3) {
-                                        log_msg(LOG_LEVEL_INFO,
-                                                        MOD_NAME "grab copied "
-                                                        "frame %u: %ux%u "
-                                                        "Y=%zu U=%zu V=%zu "
-                                                        "sequence=%u\n",
-                                                        s->copied_frames + 1,
-                                                        width, height, y_size,
-                                                        chroma_size,
-                                                        chroma_size,
-                                                        buffer->metadata().sequence);
+                                bool copied = false;
+                                if (codec == I420) {
+                                        const size_t y_size =
+                                                static_cast<size_t>(width) *
+                                                height;
+                                        const size_t chroma_size = y_size / 4;
+                                        if (planes.size() != 3 ||
+                                                        metadata_planes.size() < 3 ||
+                                                        mapped.planes.size() != 3 ||
+                                                        mapped.planes[0].len < y_size ||
+                                                        mapped.planes[1].len < chroma_size ||
+                                                        mapped.planes[2].len < chroma_size ||
+                                                        metadata_planes[0].bytesused < y_size ||
+                                                        metadata_planes[1].bytesused < chroma_size ||
+                                                        metadata_planes[2].bytesused < chroma_size) {
+                                                log_msg(LOG_LEVEL_ERROR,
+                                                                MOD_NAME
+                                                                "unexpected "
+                                                                "YUV420 buffer "
+                                                                "layout, "
+                                                                "skipping "
+                                                                "frame\n");
+                                        } else {
+                                                memcpy(dst,
+                                                                mapped.planes[0].data,
+                                                                y_size);
+                                                memcpy(dst + y_size,
+                                                                mapped.planes[1].data,
+                                                                chroma_size);
+                                                memcpy(dst + y_size + chroma_size,
+                                                                mapped.planes[2].data,
+                                                                chroma_size);
+                                                copied = true;
+                                                if (s->copied_frames < 3) {
+                                                        log_msg(LOG_LEVEL_INFO,
+                                                                        MOD_NAME
+                                                                        "grab copied "
+                                                                        "frame %u: "
+                                                                        "%ux%u Y=%zu "
+                                                                        "U=%zu V=%zu "
+                                                                        "sequence=%u\n",
+                                                                        s->copied_frames + 1,
+                                                                        width, height,
+                                                                        y_size,
+                                                                        chroma_size,
+                                                                        chroma_size,
+                                                                        buffer->metadata().sequence);
+                                                }
+                                        }
+                                } else {
+                                        const size_t row_bytes =
+                                                vc_get_linesize(width, codec);
+                                        const size_t src_stride =
+                                                s->stream_config.stride;
+                                        const size_t src_needed =
+                                                src_stride * (height - 1) +
+                                                row_bytes;
+                                        const char *copy_mode =
+                                                src_stride == row_bytes ?
+                                                "contiguous" : "row-by-row";
+                                        if (planes.size() != 1 ||
+                                                        metadata_planes.empty() ||
+                                                        mapped.planes.size() != 1 ||
+                                                        src_stride < row_bytes ||
+                                                        mapped.planes[0].len < src_needed ||
+                                                        metadata_planes[0].bytesused < src_needed) {
+                                                log_msg(LOG_LEVEL_ERROR,
+                                                                MOD_NAME
+                                                                "unexpected %s "
+                                                                "buffer layout, "
+                                                                "skipping "
+                                                                "frame\n",
+                                                                get_codec_name(codec));
+                                        } else {
+                                                if (src_stride == row_bytes) {
+                                                        memcpy(dst,
+                                                                        mapped.planes[0].data,
+                                                                        frame_size);
+                                                } else {
+                                                        for (unsigned int y = 0;
+                                                                        y < height;
+                                                                        ++y) {
+                                                                memcpy(dst + y * row_bytes,
+                                                                                mapped.planes[0].data + y * src_stride,
+                                                                                row_bytes);
+                                                        }
+                                                }
+                                                copied = true;
+                                                if (s->copied_frames < 3) {
+                                                        log_msg(LOG_LEVEL_INFO,
+                                                                        MOD_NAME
+                                                                        "grab copied "
+                                                                        "frame %u: "
+                                                                        "%ux%u %s=%zu "
+                                                                        "stride=%zu "
+                                                                        "copy=%s "
+                                                                        "sequence=%u\n",
+                                                                        s->copied_frames + 1,
+                                                                        width, height,
+                                                                        get_codec_name(codec),
+                                                                        frame_size,
+                                                                        src_stride,
+                                                                        copy_mode,
+                                                                        buffer->metadata().sequence);
+                                                }
+                                        }
                                 }
-                                s->copied_frames += 1;
+                                if (copied) {
+                                        s->frame->tiles[0].data_len = frame_size;
+                                        s->frame->timestamp =
+                                                buffer->metadata().timestamp *
+                                                90 / 1000000;
+                                        s->copied_frames += 1;
 
-                                request->reuse(libcamera::Request::ReuseBuffers);
-                                int queue_ret = s->camera->queueRequest(request);
-                                if (queue_ret != 0) {
-                                        log_msg(LOG_LEVEL_ERROR,
-                                                        MOD_NAME "failed to "
-                                                        "requeue request: %d\n",
-                                                        queue_ret);
+                                        request->reuse(
+                                                        libcamera::Request::ReuseBuffers);
+                                        int queue_ret =
+                                                s->camera->queueRequest(request);
+                                        if (queue_ret != 0) {
+                                                log_msg(LOG_LEVEL_ERROR,
+                                                                MOD_NAME
+                                                                "failed to "
+                                                                "requeue "
+                                                                "request: %d\n",
+                                                                queue_ret);
+                                        }
+                                        return s->frame;
                                 }
-                                return s->frame;
                         }
                 }
 
