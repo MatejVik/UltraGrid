@@ -59,6 +59,8 @@ extern "C" {
 #define RESIZE_ALGO_UNKN       (-2)
 #define RESIZE_ALGO_HELP_SHOWN (-3)
 int resize_algo_from_string(const char *str);
+int resize_algo_get_default(void);
+const char *resize_algo_to_string(int algo);
 
 struct resize_param {
         enum resize_mode {
@@ -77,6 +79,8 @@ struct resize_param {
 };
 void resize_frame(char *indata, codec_t in_color, char *outdata, int width,
                   int height, struct resize_param *resize_spec);
+void resize_i420_frame(char *indata, char *outdata, int width, int height,
+                       struct resize_param *resize_spec);
 
 #ifdef __cplusplus
 }

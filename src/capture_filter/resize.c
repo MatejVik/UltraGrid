@@ -76,6 +76,7 @@ struct state_resize {
     char *vo_pp_out_buffer; ///< buffer to write to if we use vo_pp wrapper (otherwise unused)
     decoder_t decoder;
     struct video_frame *dec_frame;
+    bool use_i420_path;
 };
 
 static void usage() {
@@ -191,6 +192,7 @@ reconfigure_if_needed(struct state_resize *s, const struct video_frame *in)
     }
     struct video_desc dec_desc         = video_desc_from_frame(in);
     s->out_desc                        = video_desc_from_frame(in);
+    s->use_i420_path                   = false;
     const codec_t supp_in_codecs[] = { RESIZE_SUPPORTED_PIXFMT_INIT,
                                            VIDEO_CODEC_NONE };
     if (codec_is_in_set(in->color_spec, supp_in_codecs)) {
@@ -206,12 +208,6 @@ reconfigure_if_needed(struct state_resize *s, const struct video_frame *in)
             return false;
         }
     }
-    s->out_desc.color_spec =
-        get_bits_per_component(dec_desc.color_spec) == DEPTH8 ? RGB : RG48;
-    MSG(INFO, "Decoding through %s to output pixfmt %s.\n",
-        get_codec_name(dec_desc.color_spec),
-        get_codec_name(s->out_desc.color_spec));
-
     if (s->param.mode == USE_DIMENSIONS) {
         s->out_desc.width  = s->param.target_width;
         s->out_desc.height = s->param.target_height;
@@ -219,13 +215,37 @@ reconfigure_if_needed(struct state_resize *s, const struct video_frame *in)
         s->out_desc.width = in->tiles[0].width * s->param.factor;
         s->out_desc.height = in->tiles[0].height * s->param.factor;
     }
+
+    const bool i420_even_size =
+        in->color_spec == I420 &&
+        s->decoder == vc_memcpy &&
+        dec_desc.width % 2 == 0 &&
+        dec_desc.height % 2 == 0 &&
+        s->out_desc.width % 2 == 0 &&
+        s->out_desc.height % 2 == 0;
+    if (i420_even_size) {
+        s->out_desc.color_spec = I420;
+        s->use_i420_path = true;
+        MSG(NOTICE, "using planar I420 resize path\n");
+    } else {
+        s->out_desc.color_spec =
+            get_bits_per_component(dec_desc.color_spec) == DEPTH8 ? RGB : RG48;
+    }
+    MSG(INFO, "Decoding through %s to output pixfmt %s.\n",
+        get_codec_name(dec_desc.color_spec),
+        get_codec_name(s->out_desc.color_spec));
+
     s->saved_desc = video_desc_from_frame(in);
     cleanup_common(s);
     if (s->decoder != vc_memcpy) {
         s->dec_frame               = vf_alloc_desc_data(dec_desc);
     }
-    MSG(NOTICE, "resizing from %dx%d to %dx%d\n", s->saved_desc.width,
-        s->saved_desc.height, s->out_desc.width, s->out_desc.height);
+    MSG(NOTICE, "input: %s %dx%d, output: %s %dx%d, algorithm: %s\n",
+        get_codec_name(dec_desc.color_spec), s->saved_desc.width,
+        s->saved_desc.height, get_codec_name(s->out_desc.color_spec),
+        s->out_desc.width, s->out_desc.height,
+        resize_algo_to_string(s->param.algo == RESIZE_ALGO_DFL ?
+                              resize_algo_get_default() : s->param.algo));
     return true;
 }
 
@@ -261,9 +281,16 @@ static struct video_frame *filter(void *state, struct video_frame *in)
         struct video_frame *const in_frame =
             s->decoder == vc_memcpy ? in : s->dec_frame;
 
-        resize_frame(in_frame->tiles[i].data, in_frame->color_spec,
-                     out_frame->tiles[i].data, (int) in_frame->tiles[i].width,
-                     (int) in_frame->tiles[i].height, &s->param);
+        if (s->use_i420_path) {
+            resize_i420_frame(in_frame->tiles[i].data, out_frame->tiles[i].data,
+                              (int) in_frame->tiles[i].width,
+                              (int) in_frame->tiles[i].height, &s->param);
+        } else {
+            resize_frame(in_frame->tiles[i].data, in_frame->color_spec,
+                         out_frame->tiles[i].data,
+                         (int) in_frame->tiles[i].width,
+                         (int) in_frame->tiles[i].height, &s->param);
+        }
     }
 
     VIDEO_FRAME_DISPOSE(in);
