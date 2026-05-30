@@ -951,6 +951,24 @@ bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
                                 "contiguous\n",
                                 get_codec_name(opts.codec),
                                 stream_config.stride);
+        } else if (opts.codec == I420) {
+                if (stream_config.stride < width) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "unsupported %s stride %u "
+                                        "for width %u; expected at least %u "
+                                        "for direct UltraGrid %s handoff\n",
+                                        opts.format_name.c_str(),
+                                        stream_config.stride, width, width,
+                                        get_codec_name(opts.codec));
+                        return false;
+                }
+                log_msg(LOG_LEVEL_INFO,
+                                MOD_NAME "%s luma stride %u; planar copy "
+                                "mode: %s\n",
+                                get_codec_name(opts.codec),
+                                stream_config.stride,
+                                stream_config.stride == width ?
+                                        "contiguous" : "row-by-row");
         } else if (stream_config.stride != expected_stride) {
                 log_msg(LOG_LEVEL_ERROR,
                                 MOD_NAME "unsupported %s stride %u for width "
@@ -1687,19 +1705,38 @@ struct video_frame *vidcap_libcamera_grab(void *state,
                                 }
                                 bool copied = false;
                                 if (codec == I420) {
+                                        const size_t y_row_bytes = width;
+                                        const size_t chroma_row_bytes =
+                                                width / 2;
+                                        const size_t y_stride =
+                                                s->stream_config.stride;
+                                        const size_t chroma_stride =
+                                                y_stride / 2;
                                         const size_t y_size =
-                                                static_cast<size_t>(width) *
-                                                height;
-                                        const size_t chroma_size = y_size / 4;
+                                                y_row_bytes * height;
+                                        const size_t chroma_size =
+                                                chroma_row_bytes * (height / 2);
+                                        const size_t y_needed =
+                                                y_stride * (height - 1) +
+                                                y_row_bytes;
+                                        const size_t chroma_needed =
+                                                chroma_stride *
+                                                        (height / 2 - 1) +
+                                                chroma_row_bytes;
+                                        const char *copy_mode =
+                                                y_stride == y_row_bytes ?
+                                                "contiguous" : "row-by-row";
                                         if (planes.size() != 3 ||
                                                         metadata_planes.size() < 3 ||
                                                         mapped.planes.size() != 3 ||
-                                                        mapped.planes[0].len < y_size ||
-                                                        mapped.planes[1].len < chroma_size ||
-                                                        mapped.planes[2].len < chroma_size ||
-                                                        metadata_planes[0].bytesused < y_size ||
-                                                        metadata_planes[1].bytesused < chroma_size ||
-                                                        metadata_planes[2].bytesused < chroma_size) {
+                                                        y_stride < y_row_bytes ||
+                                                        chroma_stride < chroma_row_bytes ||
+                                                        mapped.planes[0].len < y_needed ||
+                                                        mapped.planes[1].len < chroma_needed ||
+                                                        mapped.planes[2].len < chroma_needed ||
+                                                        metadata_planes[0].bytesused < y_needed ||
+                                                        metadata_planes[1].bytesused < chroma_needed ||
+                                                        metadata_planes[2].bytesused < chroma_needed) {
                                                 log_msg(LOG_LEVEL_ERROR,
                                                                 MOD_NAME
                                                                 "unexpected "
@@ -1708,15 +1745,35 @@ struct video_frame *vidcap_libcamera_grab(void *state,
                                                                 "skipping "
                                                                 "frame\n");
                                         } else {
-                                                memcpy(dst,
-                                                                mapped.planes[0].data,
-                                                                y_size);
-                                                memcpy(dst + y_size,
-                                                                mapped.planes[1].data,
-                                                                chroma_size);
-                                                memcpy(dst + y_size + chroma_size,
-                                                                mapped.planes[2].data,
-                                                                chroma_size);
+                                                if (y_stride == y_row_bytes) {
+                                                        memcpy(dst,
+                                                                        mapped.planes[0].data,
+                                                                        y_size);
+                                                        memcpy(dst + y_size,
+                                                                        mapped.planes[1].data,
+                                                                        chroma_size);
+                                                        memcpy(dst + y_size + chroma_size,
+                                                                        mapped.planes[2].data,
+                                                                        chroma_size);
+                                                } else {
+                                                        for (unsigned int y = 0;
+                                                                        y < height;
+                                                                        ++y) {
+                                                                memcpy(dst + y * y_row_bytes,
+                                                                                mapped.planes[0].data + y * y_stride,
+                                                                                y_row_bytes);
+                                                        }
+                                                        for (unsigned int y = 0;
+                                                                        y < height / 2;
+                                                                        ++y) {
+                                                                memcpy(dst + y_size + y * chroma_row_bytes,
+                                                                                mapped.planes[1].data + y * chroma_stride,
+                                                                                chroma_row_bytes);
+                                                                memcpy(dst + y_size + chroma_size + y * chroma_row_bytes,
+                                                                                mapped.planes[2].data + y * chroma_stride,
+                                                                                chroma_row_bytes);
+                                                        }
+                                                }
                                                 copied = true;
                                                 if (s->copied_frames < 3) {
                                                         log_msg(LOG_LEVEL_INFO,
@@ -1725,12 +1782,16 @@ struct video_frame *vidcap_libcamera_grab(void *state,
                                                                         "frame %u: "
                                                                         "%ux%u Y=%zu "
                                                                         "U=%zu V=%zu "
+                                                                        "stride=%zu "
+                                                                        "copy=%s "
                                                                         "sequence=%u\n",
                                                                         s->copied_frames + 1,
                                                                         width, height,
                                                                         y_size,
                                                                         chroma_size,
                                                                         chroma_size,
+                                                                        y_stride,
+                                                                        copy_mode,
                                                                         buffer->metadata().sequence);
                                                 }
                                         }
