@@ -44,8 +44,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
+#include <fcntl.h>
 #include <strings.h>
 #include <deque>
+#include <limits.h>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -54,6 +57,8 @@
 #include <string_view>
 #include <vector>
 
+#include <linux/videodev2.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -88,12 +93,11 @@ const char *validation_status_to_string(libcamera::CameraConfiguration::Status s
         return "unknown";
 }
 
-struct libcamera_options {
-        enum class HdrMode {
-                Off,
-                Auto,
-                Sensor,
-        };
+        struct libcamera_options {
+                enum class HdrMode {
+                        Off,
+                        Sensor,
+                };
 
         enum class Action {
                 Run,
@@ -112,10 +116,10 @@ struct libcamera_options {
         bool sensor_set = false;
         bool fps_set = false;
         bool format_set = false;
-        bool hdr_set = false;
-        std::string format_name = "YUV420";
-        std::string hdr_name = "off";
-        HdrMode hdr_mode = HdrMode::Off;
+                bool hdr_set = false;
+                std::string format_name = "YUV420";
+                std::string hdr_name = "unset";
+                HdrMode hdr_mode = HdrMode::Off;
         libcamera::PixelFormat pixel_format = libcamera::formats::YUV420;
         codec_t codec = I420;
         bool test_verbose = false;
@@ -136,7 +140,7 @@ const sensor_mode_cap imx708_sensor_caps[] = {
                 "full FOV-ish 16:9" },
         { { 1536, 864 }, 120, libcamera_options::HdrMode::Off, "off",
                 "cropped high-speed 16:9" },
-        { { 2304, 1296 }, 30, libcamera_options::HdrMode::Sensor, "sensor",
+        { { 2304, 1296 }, 30, libcamera_options::HdrMode::Sensor, "on",
                 "sensor HDR, discovered by rpicam --list-cameras --hdr" },
 };
 
@@ -213,14 +217,12 @@ bool is_known_imx708_camera(const std::string &model_or_id)
 
 const char *hdr_mode_to_string(libcamera_options::HdrMode hdr_mode)
 {
-        switch (hdr_mode) {
-        case libcamera_options::HdrMode::Off:
-                return "off";
-        case libcamera_options::HdrMode::Auto:
-                return "auto";
-        case libcamera_options::HdrMode::Sensor:
-                return "sensor";
-        }
+                switch (hdr_mode) {
+                case libcamera_options::HdrMode::Off:
+                        return "off";
+                case libcamera_options::HdrMode::Sensor:
+                        return "on";
+                }
         return "unknown";
 }
 
@@ -268,6 +270,279 @@ bool parse_fps(std::string_view val, double *fps)
         }
         *fps = parsed_fps;
         return true;
+}
+
+std::string read_symlink_path(const std::string &path)
+{
+        char buf[PATH_MAX] = {};
+        const ssize_t ret = readlink(path.c_str(), buf, sizeof buf - 1);
+        if (ret < 0) {
+                return {};
+        }
+        buf[ret] = '\0';
+        return buf;
+}
+
+std::string read_text_file(const std::string &path)
+{
+        FILE *file = fopen(path.c_str(), "r");
+        if (file == nullptr) {
+                return {};
+        }
+        char buf[256] = {};
+        std::string result;
+        while (fgets(buf, sizeof buf, file) != nullptr) {
+                result += buf;
+        }
+        fclose(file);
+        while (!result.empty() &&
+                        (result.back() == '\n' || result.back() == '\r')) {
+                result.pop_back();
+        }
+        return result;
+}
+
+bool xioctl(int fd, unsigned long request, void *arg)
+{
+        int ret = 0;
+        do {
+                ret = ioctl(fd, request, arg);
+        } while (ret < 0 && errno == EINTR);
+        return ret == 0;
+}
+
+struct v4l2_subdev_match {
+        std::string dev_path;
+        std::string sys_path;
+        std::string name;
+        bool camera_id_match = false;
+};
+
+bool of_node_matches_camera_id(const std::string &of_node,
+                const std::string &camera_id)
+{
+        static const std::string dt_prefix = "/sys/firmware/devicetree/base";
+        if (camera_id.empty() || of_node.empty()) {
+                return false;
+        }
+        if (of_node == camera_id) {
+                return true;
+        }
+        if (of_node.size() > dt_prefix.size() &&
+                        of_node.compare(0, dt_prefix.size(), dt_prefix) == 0) {
+                return of_node.substr(dt_prefix.size()) == camera_id;
+        }
+        return of_node.find(camera_id) != std::string::npos;
+}
+
+std::optional<v4l2_subdev_match> find_imx708_v4l_subdev(
+                const std::shared_ptr<libcamera::Camera> &camera)
+{
+        const std::string camera_id = camera->id();
+        DIR *dir = opendir("/sys/class/video4linux");
+        if (dir == nullptr) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "failed to open /sys/class/video4linux: %s\n",
+                                strerror(errno));
+                return std::nullopt;
+        }
+
+        std::vector<v4l2_subdev_match> matches;
+        while (dirent *entry = readdir(dir)) {
+                const std::string name = entry->d_name;
+                if (name.find("v4l-subdev") != 0) {
+                        continue;
+                }
+
+                const std::string sys_path =
+                        std::string("/sys/class/video4linux/") + name;
+                const std::string module =
+                        read_symlink_path(sys_path + "/device/driver/module");
+                const std::string of_node =
+                        read_symlink_path(sys_path + "/device/of_node");
+                const std::string subdev_name =
+                        read_text_file(sys_path + "/name");
+                const std::string haystack = to_lower(module + " " +
+                        of_node + " " + subdev_name);
+                if (haystack.find("imx708") == std::string::npos) {
+                        continue;
+                }
+
+                v4l2_subdev_match match = {};
+                match.dev_path = std::string("/dev/") + name;
+                match.sys_path = sys_path;
+                match.name = subdev_name;
+                match.camera_id_match =
+                        of_node_matches_camera_id(of_node, camera_id);
+                matches.push_back(match);
+        }
+        closedir(dir);
+
+        std::vector<v4l2_subdev_match> exact_matches;
+        for (const v4l2_subdev_match &match : matches) {
+                if (match.camera_id_match) {
+                        exact_matches.push_back(match);
+                }
+        }
+        if (exact_matches.size() == 1) {
+                return exact_matches.front();
+        }
+        if (exact_matches.size() > 1) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "multiple IMX708 v4l-subdevs match "
+                                "camera id %s; refusing ambiguous HDR setup\n",
+                                camera_id.c_str());
+                return std::nullopt;
+        }
+        if (matches.size() == 1) {
+                log_msg(LOG_LEVEL_WARNING,
+                                MOD_NAME "using single IMX708 v4l-subdev "
+                                "%s without camera-id match fallback\n",
+                                matches.front().dev_path.c_str());
+                return matches.front();
+        }
+        if (matches.empty()) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "no matching IMX708 v4l-subdev found "
+                                "for camera %s\n",
+                                camera_id.c_str());
+        } else {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "multiple IMX708 v4l-subdevs found "
+                                "without camera-id match; refusing ambiguous "
+                                "HDR setup\n");
+        }
+        return std::nullopt;
+}
+
+bool set_imx708_wdr_control(
+                const std::shared_ptr<libcamera::Camera> &camera,
+                bool enable, bool *changed)
+{
+        *changed = false;
+        const std::optional<v4l2_subdev_match> match =
+                find_imx708_v4l_subdev(camera);
+        if (!match) {
+                return false;
+        }
+
+        log_msg(LOG_LEVEL_INFO,
+                        MOD_NAME "selected v4l-subdev for WDR control: "
+                        "%s (%s)\n",
+                        match->dev_path.c_str(), match->name.c_str());
+
+        const int fd = open(match->dev_path.c_str(), O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "failed to open %s for WDR control: "
+                                "%s\n",
+                                match->dev_path.c_str(), strerror(errno));
+                return false;
+        }
+
+        struct v4l2_control control = {};
+        control.id = V4L2_CID_WIDE_DYNAMIC_RANGE;
+        if (!xioctl(fd, VIDIOC_G_CTRL, &control)) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "VIDIOC_G_CTRL "
+                                "V4L2_CID_WIDE_DYNAMIC_RANGE failed on %s: "
+                                "%s\n",
+                                match->dev_path.c_str(), strerror(errno));
+                close(fd);
+                return false;
+        }
+
+        const int requested_value = enable ? 1 : 0;
+        if (control.value == requested_value) {
+                log_msg(LOG_LEVEL_INFO,
+                                MOD_NAME "WDR/HDR already %s on %s\n",
+                                enable ? "enabled" : "disabled",
+                                match->dev_path.c_str());
+                close(fd);
+                return true;
+        }
+
+        control.value = requested_value;
+        if (!xioctl(fd, VIDIOC_S_CTRL, &control)) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "VIDIOC_S_CTRL "
+                                "V4L2_CID_WIDE_DYNAMIC_RANGE=%d failed on %s: "
+                                "%s\n",
+                                requested_value, match->dev_path.c_str(),
+                                strerror(errno));
+                close(fd);
+                return false;
+        }
+        close(fd);
+
+        *changed = true;
+        log_msg(LOG_LEVEL_INFO,
+                        MOD_NAME "WDR/HDR changed to %s on %s\n",
+                        enable ? "enabled" : "disabled",
+                        match->dev_path.c_str());
+        return true;
+}
+
+bool resolve_and_apply_hdr_mode(libcamera_options *opts,
+                const std::shared_ptr<libcamera::Camera> &camera,
+                bool *wdr_changed)
+{
+        *wdr_changed = false;
+        if (!opts->hdr_set) {
+                return true;
+        }
+        const std::string model = camera_model_string(camera);
+        const bool is_imx708 = is_known_imx708_camera(model);
+
+        log_msg(LOG_LEVEL_INFO,
+                        MOD_NAME "selected camera model/id: %s / %s\n",
+                        model.c_str(), camera->id().c_str());
+        log_msg(LOG_LEVEL_INFO,
+                        MOD_NAME "requested HDR mode: %s\n",
+                        opts->hdr_name.c_str());
+
+        log_msg(LOG_LEVEL_INFO,
+                        MOD_NAME "resolved HDR mode: %s\n",
+                        hdr_mode_to_string(opts->hdr_mode));
+
+        if (opts->hdr_mode == libcamera_options::HdrMode::Sensor && !is_imx708) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "hdr is currently supported only for "
+                                "known IMX708 cameras; got %s\n",
+                                model.c_str());
+                return false;
+        }
+
+        if (!is_imx708) {
+                return true;
+        }
+
+        if (opts->hdr_mode == libcamera_options::HdrMode::Sensor) {
+                const libcamera::Size hdr_sensor_size = { 2304, 1296 };
+                if (opts->sensor_set) {
+                        const libcamera::Size requested_sensor_size(
+                                        opts->sensor_width, opts->sensor_height);
+                        if (requested_sensor_size != hdr_sensor_size) {
+                                log_msg(LOG_LEVEL_ERROR,
+                                                MOD_NAME "IMX708 sensor HDR "
+                                                "supports only sensor=2304x1296 "
+                                                "max_fps=30; omit sensor= or "
+                                                "use sensor=2304x1296.\n");
+                                return false;
+                        }
+                } else {
+                        opts->sensor_width = hdr_sensor_size.width;
+                        opts->sensor_height = hdr_sensor_size.height;
+                        opts->sensor_set = true;
+                        log_msg(LOG_LEVEL_INFO,
+                                        MOD_NAME "HDR requested; using internal "
+                                        "sensor output 2304x1296 max_fps=30\n");
+                }
+        }
+
+        const bool enable_sensor_hdr =
+                opts->hdr_mode == libcamera_options::HdrMode::Sensor;
+        return set_imx708_wdr_control(camera, enable_sensor_hdr, wdr_changed);
 }
 
 void log_stream_config(const char *label,
@@ -617,9 +892,9 @@ void vidcap_libcamera_probe(struct device_info **available_cards, int *count,
 
 void print_usage()
 {
-        printf("libcamera capture\n");
-        printf("Usage:\n");
-        printf("\t-t libcamera[:d=<index>|camera=<index>][:sensor=WxH][:size=WxH][:fps=N][:format=YUV420|I420|UYVY|YUYV][:list|caps|test|help|fullhelp]\n");
+                printf("libcamera capture\n");
+                printf("Usage:\n");
+                printf("\t-t libcamera[:d=<index>|camera=<index>][:hdr|hdr=on|hdr=off][:sensor=WxH][:size=WxH][:fps=N][:format=YUV420|I420|UYVY|YUYV][:list|caps|test|help|fullhelp]\n");
         printf("\n");
 }
 
@@ -631,8 +906,10 @@ void show_fullhelp()
         printf("size=WxH selects the output stream size.\n");
         printf("sensor=WxH optionally requests the libcamera sensor output size before ISP scaling.\n");
         printf("fps=N requests frame rate through FrameDurationLimits when streaming starts.\n");
-        printf("Known IMX708 sensor fps limits are checked only when sensor=WxH is provided.\n");
-        printf("hdr=off is the current default. hdr=auto and hdr=sensor are recognized but not implemented yet in this module.\n");
+        printf("Known IMX708 sensor fps limits are checked for sensor=WxH and hdr requests.\n");
+        printf("hdr or hdr=on enables experimental IMX708 sensor HDR.\n");
+        printf("hdr=off explicitly disables IMX708 WDR/HDR. Without hdr, WDR/HDR state is not touched.\n");
+        printf("IMX708 HDR uses internal sensor mode 2304x1296 and max_fps=30.\n");
         printf("format=YUV420 selects planar 4:2:0 and maps to UltraGrid I420. I420 is an alias.\n");
         printf("format=UYVY and format=YUYV select packed 8-bit 4:2:2 handoff if libcamera can negotiate them natively.\n");
         printf("format=YUV422 is recognized but rejected because this UltraGrid tree has no direct matching internal planar 8-bit 4:2:2 codec mapping.\n");
@@ -648,9 +925,10 @@ void show_fullhelp()
         printf("mode=N is intentionally not part of the public libcamera API because libcamera/RPi sensor modes are a different layer than VideoRecording output.\n");
         printf("Supported output formats for native frame handoff: YUV420/I420, UYVY, YUYV.\n");
         printf("Note: size=1280x720 may select a cropped sensor mode unless sensor= is explicitly used.\n");
-        printf("Examples:\n");
-        printf("\tFull-FOV-ish 720p56: -t libcamera:d=0:sensor=2304x1296:size=1280x720:fps=56:format=YUV420\n");
-        printf("\tCropped 720p60+:     -t libcamera:d=0:sensor=1536x864:size=1280x720:fps=60:format=YUV420\n");
+                printf("Examples:\n");
+                printf("\tFull-FOV-ish 720p56: -t libcamera:d=0:sensor=2304x1296:size=1280x720:fps=56:format=YUV420\n");
+                printf("\tCropped 720p60+:     -t libcamera:d=0:sensor=1536x864:size=1280x720:fps=60:format=YUV420\n");
+                printf("\tIMX708 HDR 720p30:   -t libcamera:d=0:hdr:size=1280x720:fps=30:format=YUV420\n");
         printf("Status: progressive YUV capture handoff is implemented.\n");
 }
 
@@ -659,7 +937,8 @@ void show_help_header()
         print_usage();
         printf("Examples:\n");
         printf("\t-t libcamera\n");
-        printf("\t-t libcamera:d=0:size=1280x720:fps=50:format=YUV420\n");
+                printf("\t-t libcamera:d=0:size=1280x720:fps=50:format=YUV420\n");
+                printf("\t-t libcamera:d=0:hdr:size=1280x720:fps=30:format=YUV420\n");
         printf("\t-t libcamera:d=0:sensor=2304x1296:size=1280x720:fps=56:format=YUV420\n");
         printf("\t-t libcamera:d=0:sensor=1536x864:size=1280x720:fps=60:format=YUV420\n");
         printf("\t-t libcamera:d=0:size=1280x720:fps=50:format=UYVY\n");
@@ -729,38 +1008,51 @@ int parse_fmt(std::string_view fmt, libcamera_options *opts)
                         opts->sensor_width = sensor_size.width;
                         opts->sensor_height = sensor_size.height;
                         opts->sensor_set = true;
-                } else if (key == "hdr") {
-                        if (val.size() == strlen("off") &&
-                                        strncasecmp(val.data(), "off",
-                                                val.size()) == 0) {
-                                opts->hdr_set = true;
-                                opts->hdr_mode = libcamera_options::HdrMode::Off;
-                                opts->hdr_name = "off";
-                        } else if ((val.size() == strlen("auto") &&
-                                           strncasecmp(val.data(), "auto",
-                                                   val.size()) == 0) ||
-                                        (val.size() == strlen("sensor") &&
-                                                strncasecmp(val.data(), "sensor",
+                        } else if (key == "hdr") {
+                                if (val.empty() || (val.size() == strlen("on") &&
+                                                strncasecmp(val.data(), "on",
                                                         val.size()) == 0)) {
-                                log_msg(LOG_LEVEL_ERROR,
-                                                MOD_NAME "hdr=%.*s is not "
-                                                "implemented yet; local "
-                                                "investigation shows sensor HDR "
-                                                "requires camera-specific "
-                                                "handling before libcamera mode "
-                                                "selection\n",
-                                                static_cast<int>(val.size()),
-                                                val.data());
-                                return VIDCAP_INIT_FAIL;
-                        } else {
-                                log_msg(LOG_LEVEL_ERROR,
-                                                MOD_NAME "unsupported hdr=%.*s; "
-                                                "supported value in this branch "
-                                                "is hdr=off\n",
-                                                static_cast<int>(val.size()),
-                                                val.data());
-                                return VIDCAP_INIT_FAIL;
-                        }
+                                        opts->hdr_set = true;
+                                        opts->hdr_mode = libcamera_options::HdrMode::Sensor;
+                                        opts->hdr_name = "on";
+                                } else if (val.size() == strlen("off") &&
+                                                strncasecmp(val.data(), "off",
+                                                        val.size()) == 0) {
+                                        opts->hdr_set = true;
+                                        opts->hdr_mode = libcamera_options::HdrMode::Off;
+                                        opts->hdr_name = "off";
+                                } else if (val.size() == strlen("sensor") &&
+                                                strncasecmp(val.data(), "sensor",
+                                                        val.size()) == 0) {
+                                        opts->hdr_set = true;
+                                        opts->hdr_mode = libcamera_options::HdrMode::Sensor;
+                                        opts->hdr_name = "sensor";
+                                } else if (val.size() == strlen("single-exp") &&
+                                                strncasecmp(val.data(), "single-exp",
+                                                        val.size()) == 0) {
+                                        log_msg(LOG_LEVEL_ERROR,
+                                                        MOD_NAME "hdr=single-exp is not "
+                                                        "implemented in UltraGrid "
+                                                        "libcamera module\n");
+                                        return VIDCAP_INIT_FAIL;
+                                } else if (val.size() == strlen("auto") &&
+                                                strncasecmp(val.data(), "auto",
+                                                        val.size()) == 0) {
+                                        log_msg(LOG_LEVEL_ERROR,
+                                                        MOD_NAME "hdr=auto is deprecated "
+                                                        "and ambiguous; use bare hdr or "
+                                                        "hdr=on to enable IMX708 sensor "
+                                                        "HDR, or hdr=off to disable it\n");
+                                        return VIDCAP_INIT_FAIL;
+                                } else {
+                                        log_msg(LOG_LEVEL_ERROR,
+                                                        MOD_NAME "unsupported hdr=%.*s; "
+                                                        "valid public values are hdr, "
+                                                        "hdr=on, hdr=off\n",
+                                                        static_cast<int>(val.size()),
+                                                        val.data());
+                                        return VIDCAP_INIT_FAIL;
+                                }
                 } else if (key == "mode") {
                         log_msg(LOG_LEVEL_ERROR,
                                         MOD_NAME "mode is not supported by "
@@ -912,16 +1204,24 @@ void print_known_sensor_caps(const std::shared_ptr<libcamera::Camera> &camera)
                 return;
         }
 
-        printf("  Known sensor mode caps:\n");
-        for (const sensor_mode_cap &cap : imx708_sensor_caps) {
-                printf("    sensor=%s hdr=%s max_fps=%u (%s)\n",
-                                cap.sensor_size.toString().c_str(),
-                                cap.hdr_name, cap.max_fps, cap.note);
+                printf("  Known IMX708 SDR sensor mode caps:\n");
+                for (const sensor_mode_cap &cap : imx708_sensor_caps) {
+                        if (cap.hdr_mode == libcamera_options::HdrMode::Off) {
+                                printf("    sensor=%s max_fps=%u (%s)\n",
+                                                cap.sensor_size.toString().c_str(),
+                                                cap.max_fps, cap.note);
+                        }
+                }
+                printf("  Known IMX708 HDR sensor mode caps:\n");
+                printf("    hdr / hdr=on: internal sensor=2304x1296 max_fps=30 "
+                                "(experimental sensor HDR)\n");
+                printf("    hdr=off explicitly disables IMX708 WDR/HDR; without hdr, "
+                                "WDR/HDR state is not touched.\n");
+                printf("  Note: size=1280x720 alone may select the cropped 1536x864 sensor mode.\n");
+                printf("  Example full-FOV-ish 720p56: -t libcamera:d=0:sensor=2304x1296:size=1280x720:fps=56:format=YUV420\n");
+                printf("  Example cropped 720p60+: -t libcamera:d=0:sensor=1536x864:size=1280x720:fps=60:format=YUV420\n");
+                printf("  Example HDR 720p30: -t libcamera:d=0:hdr:size=1280x720:fps=30:format=YUV420\n");
         }
-        printf("  Note: size=1280x720 alone may select the cropped 1536x864 sensor mode.\n");
-        printf("  Example full-FOV-ish 720p56: -t libcamera:d=0:sensor=2304x1296:size=1280x720:fps=56:format=YUV420\n");
-        printf("  Example cropped 720p60+: -t libcamera:d=0:sensor=1536x864:size=1280x720:fps=60:format=YUV420\n");
-}
 
 bool print_camera_help(const std::shared_ptr<libcamera::Camera> &camera,
                 size_t index)
@@ -1085,6 +1385,21 @@ bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
                                 "camera start if supported\n",
                                 opts.fps);
         }
+        if (opts.hdr_set &&
+                        opts.hdr_mode == libcamera_options::HdrMode::Sensor &&
+                        opts.sensor_set &&
+                        is_known_imx708_camera(camera_model_string(s->camera))) {
+                const libcamera::Size requested_sensor_size(opts.sensor_width,
+                                opts.sensor_height);
+                if (find_known_sensor_cap(s->camera, requested_sensor_size,
+                                opts.hdr_mode) == nullptr) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "IMX708 sensor HDR supports "
+                                        "only sensor=2304x1296 max_fps=30; "
+                                        "omit sensor= or use sensor=2304x1296.\n");
+                        return false;
+                }
+        }
 
         libcamera::CameraConfiguration::Status status = config->validate();
         log_msg(LOG_LEVEL_INFO, MOD_NAME "configuration validation: %s\n",
@@ -1115,12 +1430,30 @@ bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
                                 MOD_NAME "requested configuration is invalid\n");
                 return false;
         }
+        if (opts.hdr_set &&
+                        opts.hdr_mode == libcamera_options::HdrMode::Sensor &&
+                        !config->sensorConfig) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "hdr requires a known sensor mode; "
+                                "omit sensor= or use sensor=2304x1296 for "
+                                "IMX708 sensor HDR\n");
+                return false;
+        }
         if (opts.sensor_set && config->sensorConfig) {
                 const std::string camera_model = camera_model_string(s->camera);
                 const libcamera::Size validated_sensor_size =
                         config->sensorConfig->outputSize;
                 const sensor_mode_cap *cap = find_known_sensor_cap(s->camera,
                                 validated_sensor_size, opts.hdr_mode);
+                if (opts.hdr_set &&
+                                opts.hdr_mode == libcamera_options::HdrMode::Sensor &&
+                                cap == nullptr) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "IMX708 sensor HDR supports "
+                                        "only sensor=2304x1296 max_fps=30; "
+                                        "omit sensor= or use sensor=2304x1296.\n");
+                        return false;
+                }
                 if (cap != nullptr && opts.fps_set &&
                                 opts.fps > cap->max_fps + 0.001) {
                         log_msg(LOG_LEVEL_ERROR,
@@ -1919,14 +2252,62 @@ int vidcap_libcamera_init(const struct vidcap_params *params, void **state)
                 } else {
                         std::shared_ptr<libcamera::Camera> camera =
                                 cameras[opts.camera_index];
-                        log_msg(LOG_LEVEL_INFO, MOD_NAME "using camera %zu: %s\n",
-                                        opts.camera_index, camera->id().c_str());
+                                log_msg(LOG_LEVEL_INFO, MOD_NAME "using camera %zu: %s\n",
+                                                opts.camera_index, camera->id().c_str());
+                                bool hdr_changed = false;
+                                if (opts.hdr_set) {
+                                        if (!resolve_and_apply_hdr_mode(&opts, camera,
+                                                        &hdr_changed)) {
+                                                have_config = false;
+                                                goto init_done;
+                                        }
+                                }
+                        if (hdr_changed) {
+                                log_msg(LOG_LEVEL_INFO,
+                                                MOD_NAME "WDR/HDR control "
+                                                "changed; restarting "
+                                                "CameraManager before final "
+                                                "configuration\n");
+                                camera.reset();
+                                cameras.clear();
+                                camera_manager->stop();
+                                camera_manager.reset();
+                                camera_manager =
+                                        std::make_unique<libcamera::CameraManager>();
+                                if (camera_manager->start() != 0) {
+                                        log_msg(LOG_LEVEL_ERROR,
+                                                        MOD_NAME "failed to "
+                                                        "restart CameraManager "
+                                                        "after HDR setup\n");
+                                        have_config = false;
+                                        goto init_done;
+                                }
+                                cameras = camera_manager->cameras();
+                                if (opts.camera_index >= cameras.size()) {
+                                        log_msg(LOG_LEVEL_ERROR,
+                                                        MOD_NAME "camera index "
+                                                        "%zu out of range after "
+                                                        "HDR setup (found %zu "
+                                                        "cameras)\n",
+                                                        opts.camera_index,
+                                                        cameras.size());
+                                        have_config = false;
+                                        goto init_done;
+                                }
+                                camera = cameras[opts.camera_index];
+                                log_msg(LOG_LEVEL_INFO,
+                                                MOD_NAME "using camera %zu "
+                                                "after HDR setup: %s\n",
+                                                opts.camera_index,
+                                                camera->id().c_str());
+                        }
                         new_state = new vidcap_libcamera_state();
                         new_state->camera_manager = std::move(camera_manager);
                         new_state->camera = camera;
                         have_config = configure_camera(new_state, opts);
                 }
         }
+init_done:
 
         if (opts.action == libcamera_options::Action::Help ||
                         opts.action == libcamera_options::Action::List ||
