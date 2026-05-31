@@ -119,6 +119,22 @@ static void uyvy_to_yuv422p(AVFrame * __restrict out_frame, const unsigned char 
         }
 }
 
+static void yuyv_to_yuv422p(AVFrame * __restrict out_frame, const unsigned char * __restrict src, int width, int height)
+{
+        for(int y = 0; y < (int) height; ++y) {
+                unsigned char *dst_y = out_frame->data[0] + out_frame->linesize[0] * y;
+                unsigned char *dst_cb = out_frame->data[1] + out_frame->linesize[1] * y;
+                unsigned char *dst_cr = out_frame->data[2] + out_frame->linesize[2] * y;
+
+                OPTIMIZED_FOR (int x = 0; x < width; x += 2) {
+                        *dst_y++ = *src++;
+                        *dst_cb++ = *src++;
+                        *dst_y++ = *src++;
+                        *dst_cr++ = *src++;
+                }
+        }
+}
+
 static void uyvy_to_vuya(AVFrame * __restrict out_frame, const unsigned char * __restrict src, int width, int height)
         __attribute__((unused));
 static void uyvy_to_vuya(AVFrame * __restrict out_frame, const unsigned char * __restrict src, int width, int height)
@@ -1379,6 +1395,8 @@ static const struct uv_to_av_conversion *get_uv_to_av_conversions() {
 #endif
                 { UYVY, AV_PIX_FMT_YUV422P,     uyvy_to_yuv422p },
                 { UYVY, AV_PIX_FMT_YUVJ422P,    uyvy_to_yuv422p },
+                { YUYV, AV_PIX_FMT_YUV422P,     yuyv_to_yuv422p },
+                { YUYV, AV_PIX_FMT_YUVJ422P,    yuyv_to_yuv422p },
 #if VUYX_PRESENT
                 { UYVY, AV_PIX_FMT_VUYA,        uyvy_to_vuya },
                 { UYVY, AV_PIX_FMT_VUYX,        uyvy_to_vuya },
@@ -1470,6 +1488,13 @@ static QSORT_S_COMP_DEFINE(compare_uv_pixfmts, a, b, orig_c) {
  * ug_to_av_pixfmt_map).
  */
 static decoder_t get_decoder_from_uv_to_uv(codec_t in, enum AVPixelFormat av, codec_t *out) {
+        if (in == YUYV &&
+                        (av == AV_PIX_FMT_YUV422P ||
+                         av == AV_PIX_FMT_YUVJ422P)) {
+                *out = in;
+                return vc_memcpy;
+        }
+
         codec_t intermediate_codecs[VIDEO_CODEC_COUNT];
         int ic_count = get_intermediate_codecs_from_uv_to_av(in, av, intermediate_codecs);
         if (ic_count == 0) {
@@ -1818,6 +1843,9 @@ to_lavc_vid_conv_callback_name(pixfmt_callback_t callback)
 {
         if (callback == uyvy_to_yuv422p) {
                 return "uyvy_to_yuv422p";
+        }
+        if (callback == yuyv_to_yuv422p) {
+                return "yuyv_to_yuv422p";
         }
         return callback != NULL ? "other" : "none";
 }
