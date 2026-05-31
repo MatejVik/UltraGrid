@@ -318,10 +318,17 @@ struct state_video_compress_libav {
         bool      lavc_profile_enabled = false;
         time_ns_t lavc_profile_window_start = 0;
         uint64_t  lavc_profile_frames = 0;
+        uint64_t  lavc_profile_output_packets = 0;
         uint64_t  lavc_profile_bytes_read = 0;
         uint64_t  lavc_profile_bytes_written = 0;
-        uint64_t  lavc_profile_total_ns = 0;
-        uint64_t  lavc_profile_max_ns = 0;
+        uint64_t  lavc_profile_prepare_total_ns = 0;
+        uint64_t  lavc_profile_prepare_max_ns = 0;
+        uint64_t  lavc_profile_send_total_ns = 0;
+        uint64_t  lavc_profile_send_max_ns = 0;
+        uint64_t  lavc_profile_receive_total_ns = 0;
+        uint64_t  lavc_profile_receive_max_ns = 0;
+        uint64_t  lavc_profile_encode_total_ns = 0;
+        uint64_t  lavc_profile_encode_max_ns = 0;
         AVPixelFormat lavc_profile_selected_pixfmt = AV_PIX_FMT_NONE;
         string    lavc_profile_encoder;
 
@@ -347,10 +354,17 @@ lavc_profile_reset_window(struct state_video_compress_libav *s)
 {
         s->lavc_profile_window_start = get_time_in_ns();
         s->lavc_profile_frames = 0;
+        s->lavc_profile_output_packets = 0;
         s->lavc_profile_bytes_read = 0;
         s->lavc_profile_bytes_written = 0;
-        s->lavc_profile_total_ns = 0;
-        s->lavc_profile_max_ns = 0;
+        s->lavc_profile_prepare_total_ns = 0;
+        s->lavc_profile_prepare_max_ns = 0;
+        s->lavc_profile_send_total_ns = 0;
+        s->lavc_profile_send_max_ns = 0;
+        s->lavc_profile_receive_total_ns = 0;
+        s->lavc_profile_receive_max_ns = 0;
+        s->lavc_profile_encode_total_ns = 0;
+        s->lavc_profile_encode_max_ns = 0;
 }
 
 static bool
@@ -376,7 +390,9 @@ lavc_profile_av_image_size(AVPixelFormat pix_fmt, int width, int height)
 static void
 lavc_profile_account(struct state_video_compress_libav *s,
                      size_t input_bytes, bool direct_input_planes,
-                     time_ns_t prepare_ns)
+                     time_ns_t prepare_ns, time_ns_t send_ns,
+                     time_ns_t receive_ns, time_ns_t encode_ns,
+                     bool output_packet)
 {
         if (!s->lavc_profile_enabled) {
                 return;
@@ -420,11 +436,21 @@ lavc_profile_account(struct state_video_compress_libav *s,
 #endif
 
         s->lavc_profile_frames += 1;
+        s->lavc_profile_output_packets += output_packet ? 1 : 0;
         s->lavc_profile_bytes_read += bytes_read;
         s->lavc_profile_bytes_written += bytes_written;
-        s->lavc_profile_total_ns += prepare_ns;
-        s->lavc_profile_max_ns =
-                std::max<uint64_t>(s->lavc_profile_max_ns, prepare_ns);
+        s->lavc_profile_prepare_total_ns += prepare_ns;
+        s->lavc_profile_prepare_max_ns =
+                std::max<uint64_t>(s->lavc_profile_prepare_max_ns, prepare_ns);
+        s->lavc_profile_send_total_ns += send_ns;
+        s->lavc_profile_send_max_ns =
+                std::max<uint64_t>(s->lavc_profile_send_max_ns, send_ns);
+        s->lavc_profile_receive_total_ns += receive_ns;
+        s->lavc_profile_receive_max_ns =
+                std::max<uint64_t>(s->lavc_profile_receive_max_ns, receive_ns);
+        s->lavc_profile_encode_total_ns += encode_ns;
+        s->lavc_profile_encode_max_ns =
+                std::max<uint64_t>(s->lavc_profile_encode_max_ns, encode_ns);
 
         const time_ns_t now = get_time_in_ns();
         const double elapsed =
@@ -447,8 +473,12 @@ lavc_profile_account(struct state_video_compress_libav *s,
                         "swscale=%s direct_plane_copy=%s packed422_unpack=%s "
                         "ug_internal_conv=%s intermediate=%s conv=%s "
                         "avg_prepare_ms=%.3f max_prepare_ms=%.3f "
+                        "avg_send_ms=%.3f max_send_ms=%.3f "
+                        "avg_receive_ms=%.3f max_receive_ms=%.3f "
+                        "avg_total_encode_ms=%.3f max_total_encode_ms=%.3f "
                         "read_MBps=%.2f written_MBps=%.2f "
-                        "avframe_buffers=%s per_frame_alloc=%s frames=%" PRIu64
+                        "avframe_buffers=%s per_frame_alloc=%s "
+                        "encoded_frames=%" PRIu64 " output_packets=%" PRIu64
                         "\n",
                         get_codec_name(s->saved_desc.color_spec),
                         s->saved_desc.width, s->saved_desc.height,
@@ -465,10 +495,22 @@ lavc_profile_account(struct state_video_compress_libav *s,
                         internal_conv ? "yes" : "no",
                         intermediate_name,
                         conv_info.conversion_name,
-                        (s->lavc_profile_total_ns /
+                        (s->lavc_profile_prepare_total_ns /
                                         (double) s->lavc_profile_frames) /
                                 1000000.0,
-                        s->lavc_profile_max_ns / 1000000.0,
+                        s->lavc_profile_prepare_max_ns / 1000000.0,
+                        (s->lavc_profile_send_total_ns /
+                                        (double) s->lavc_profile_frames) /
+                                1000000.0,
+                        s->lavc_profile_send_max_ns / 1000000.0,
+                        (s->lavc_profile_receive_total_ns /
+                                        (double) s->lavc_profile_frames) /
+                                1000000.0,
+                        s->lavc_profile_receive_max_ns / 1000000.0,
+                        (s->lavc_profile_encode_total_ns /
+                                        (double) s->lavc_profile_frames) /
+                                1000000.0,
+                        s->lavc_profile_encode_max_ns / 1000000.0,
                         (s->lavc_profile_bytes_read / elapsed) /
                                 (1024.0 * 1024.0),
                         (s->lavc_profile_bytes_written / elapsed) /
@@ -476,7 +518,8 @@ lavc_profile_account(struct state_video_compress_libav *s,
                         conv_info.avframe_buffers_reused ? "reused" :
                                                            "unknown",
                         conv_info.avframe_allocated_per_frame ? "yes" : "no",
-                        s->lavc_profile_frames);
+                        s->lavc_profile_frames,
+                        s->lavc_profile_output_packets);
 
         lavc_profile_reset_window(s);
 }
@@ -1752,18 +1795,24 @@ static shared_ptr<video_frame> libavcodec_compress_tile(void *state, shared_ptr<
         }
 #endif //HAVE_SWSCALE
         time_ns_t t2 = get_time_in_ns();
-        lavc_profile_account(s, tx->tiles[0].data_len, direct_input_planes,
-                             t2 - t0);
 
         /* encode the image */
         frame->pts = s->cur_pts++;
         store_metadata(s, tx.get(), frame->pts);
+        time_ns_t send_start = get_time_in_ns();
         if (int ret = avcodec_send_frame(s->codec_ctx, frame)) {
                 print_libav_error(LOG_LEVEL_WARNING, "[lavc] Error encoding frame", ret);
                 return {};
         }
+        time_ns_t send_end = get_time_in_ns();
 
+        time_ns_t receive_start = get_time_in_ns();
         shared_ptr<video_frame> out = receive_packet(s);
+        time_ns_t receive_end = get_time_in_ns();
+        lavc_profile_account(s, tx->tiles[0].data_len, direct_input_planes,
+                             t2 - t0, send_end - send_start,
+                             receive_end - receive_start,
+                             receive_end - send_start, out != nullptr);
         time_ns_t t3 = get_time_in_ns();
         LOG(LOG_LEVEL_DEBUG2) << MOD_NAME << "duration pixfmt change: "
                 << (t1 - t0) / NS_IN_SEC_DBL <<
