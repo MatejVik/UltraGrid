@@ -35,6 +35,7 @@
 #include "config.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cinttypes>
@@ -48,6 +49,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -87,6 +89,12 @@ const char *validation_status_to_string(libcamera::CameraConfiguration::Status s
 }
 
 struct libcamera_options {
+        enum class HdrMode {
+                Off,
+                Auto,
+                Sensor,
+        };
+
         enum class Action {
                 Run,
                 Help,
@@ -99,15 +107,37 @@ struct libcamera_options {
         libcamera::Size size = {};
         unsigned int sensor_width = 0;
         unsigned int sensor_height = 0;
-        unsigned int fps = 0;
+        double fps = 0.0;
         bool size_set = false;
         bool sensor_set = false;
         bool fps_set = false;
         bool format_set = false;
+        bool hdr_set = false;
         std::string format_name = "YUV420";
+        std::string hdr_name = "off";
+        HdrMode hdr_mode = HdrMode::Off;
         libcamera::PixelFormat pixel_format = libcamera::formats::YUV420;
         codec_t codec = I420;
         bool test_verbose = false;
+};
+
+struct sensor_mode_cap {
+        libcamera::Size sensor_size;
+        unsigned int max_fps;
+        libcamera_options::HdrMode hdr_mode;
+        const char *hdr_name;
+        const char *note;
+};
+
+const sensor_mode_cap imx708_sensor_caps[] = {
+        { { 4608, 2592 }, 14, libcamera_options::HdrMode::Off, "off",
+                "full resolution" },
+        { { 2304, 1296 }, 56, libcamera_options::HdrMode::Off, "off",
+                "full FOV-ish 16:9" },
+        { { 1536, 864 }, 120, libcamera_options::HdrMode::Off, "off",
+                "cropped high-speed 16:9" },
+        { { 2304, 1296 }, 30, libcamera_options::HdrMode::Sensor, "sensor",
+                "sensor HDR, discovered by rpicam --list-cameras --hdr" },
 };
 
 struct libcamera_format_mapping {
@@ -150,6 +180,67 @@ bool is_packed_422(codec_t codec)
         return codec == UYVY || codec == YUYV;
 }
 
+std::string to_lower(std::string_view value)
+{
+        std::string lowered(value);
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                        [](unsigned char c) { return std::tolower(c); });
+        return lowered;
+}
+
+std::string camera_model_string(
+                const std::shared_ptr<libcamera::Camera> &camera)
+{
+        std::string model;
+        const std::optional<std::string_view> prop_model =
+                camera->properties().get(libcamera::properties::Model);
+        if (prop_model && !prop_model->empty()) {
+                model.assign(prop_model->begin(), prop_model->end());
+        }
+        if (model.empty()) {
+                model = camera->id();
+        }
+        return model;
+}
+
+bool is_known_imx708_camera(const std::string &model_or_id)
+{
+        const std::string model = to_lower(model_or_id);
+        return model.find("imx708") != std::string::npos ||
+                model.find("imx708_wide") != std::string::npos ||
+                model.find("imx708_wide_noir") != std::string::npos;
+}
+
+const char *hdr_mode_to_string(libcamera_options::HdrMode hdr_mode)
+{
+        switch (hdr_mode) {
+        case libcamera_options::HdrMode::Off:
+                return "off";
+        case libcamera_options::HdrMode::Auto:
+                return "auto";
+        case libcamera_options::HdrMode::Sensor:
+                return "sensor";
+        }
+        return "unknown";
+}
+
+const sensor_mode_cap *find_known_sensor_cap(
+                const std::shared_ptr<libcamera::Camera> &camera,
+                const libcamera::Size &sensor_size,
+                libcamera_options::HdrMode hdr_mode)
+{
+        if (!is_known_imx708_camera(camera_model_string(camera))) {
+                return nullptr;
+        }
+        for (const sensor_mode_cap &cap : imx708_sensor_caps) {
+                if (cap.sensor_size == sensor_size &&
+                                cap.hdr_mode == hdr_mode) {
+                        return &cap;
+                }
+        }
+        return nullptr;
+}
+
 bool parse_size(std::string_view val, libcamera::Size *size)
 {
         auto width = tokenize(val, 'x', '"');
@@ -162,6 +253,20 @@ bool parse_size(std::string_view val, libcamera::Size *size)
                 return false;
         }
         *size = { parsed_width, parsed_height };
+        return true;
+}
+
+bool parse_fps(std::string_view val, double *fps)
+{
+        std::string fps_str(val);
+        char *end = nullptr;
+        errno = 0;
+        const double parsed_fps = strtod(fps_str.c_str(), &end);
+        if (errno != 0 || end == fps_str.c_str() || *end != '\0' ||
+                        !std::isfinite(parsed_fps) || parsed_fps <= 0.0) {
+                return false;
+        }
+        *fps = parsed_fps;
         return true;
 }
 
@@ -425,7 +530,7 @@ bool start_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
         libcamera::ControlList *start_controls = nullptr;
         if (opts.fps_set) {
                 const int64_t frame_duration_us =
-                        1000000 / static_cast<int64_t>(opts.fps);
+                        static_cast<int64_t>(std::llround(1000000.0 / opts.fps));
                 if (s->camera->controls().count(
                                 libcamera::controls::FrameDurationLimits.id()) >
                                 0) {
@@ -434,12 +539,12 @@ bool start_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
                                                 frame_duration_us });
                         start_controls = &controls;
                         log_msg(LOG_LEVEL_INFO,
-                                        MOD_NAME "applying fps=%u via "
+                                        MOD_NAME "applying fps=%.3f via "
                                         "FrameDurationLimits=%" PRId64 " us\n",
                                         opts.fps, frame_duration_us);
                 } else {
                         log_msg(LOG_LEVEL_INFO,
-                                        MOD_NAME "requested fps=%u; "
+                                        MOD_NAME "requested fps=%.3f; "
                                         "FrameDurationLimits control is not "
                                         "available\n",
                                         opts.fps);
@@ -526,6 +631,8 @@ void show_fullhelp()
         printf("size=WxH selects the output stream size.\n");
         printf("sensor=WxH optionally requests the libcamera sensor output size before ISP scaling.\n");
         printf("fps=N requests frame rate through FrameDurationLimits when streaming starts.\n");
+        printf("Known IMX708 sensor fps limits are checked only when sensor=WxH is provided.\n");
+        printf("hdr=off is the current default. hdr=auto and hdr=sensor are recognized but not implemented yet in this module.\n");
         printf("format=YUV420 selects planar 4:2:0 and maps to UltraGrid I420. I420 is an alias.\n");
         printf("format=UYVY and format=YUYV select packed 8-bit 4:2:2 handoff if libcamera can negotiate them natively.\n");
         printf("format=YUV422 is recognized but rejected because this UltraGrid tree has no direct matching internal planar 8-bit 4:2:2 codec mapping.\n");
@@ -540,6 +647,10 @@ void show_fullhelp()
         printf("fullhelp prints this detailed parameter description.\n");
         printf("mode=N is intentionally not part of the public libcamera API because libcamera/RPi sensor modes are a different layer than VideoRecording output.\n");
         printf("Supported output formats for native frame handoff: YUV420/I420, UYVY, YUYV.\n");
+        printf("Note: size=1280x720 may select a cropped sensor mode unless sensor= is explicitly used.\n");
+        printf("Examples:\n");
+        printf("\tFull-FOV-ish 720p56: -t libcamera:d=0:sensor=2304x1296:size=1280x720:fps=56:format=YUV420\n");
+        printf("\tCropped 720p60+:     -t libcamera:d=0:sensor=1536x864:size=1280x720:fps=60:format=YUV420\n");
         printf("Status: progressive YUV capture handoff is implemented.\n");
 }
 
@@ -549,7 +660,8 @@ void show_help_header()
         printf("Examples:\n");
         printf("\t-t libcamera\n");
         printf("\t-t libcamera:d=0:size=1280x720:fps=50:format=YUV420\n");
-        printf("\t-t libcamera:d=0:sensor=2304x1296:size=1280x720:fps=60:format=YUV420\n");
+        printf("\t-t libcamera:d=0:sensor=2304x1296:size=1280x720:fps=56:format=YUV420\n");
+        printf("\t-t libcamera:d=0:sensor=1536x864:size=1280x720:fps=60:format=YUV420\n");
         printf("\t-t libcamera:d=0:size=1280x720:fps=50:format=UYVY\n");
         printf("\t-t libcamera:list\n");
         printf("\t-t libcamera:caps\n");
@@ -557,6 +669,7 @@ void show_help_header()
         printf("\n");
         printf("Default uses libcamera's VideoRecording configuration.\n");
         printf("Supported output formats: YUV420/I420; UYVY/YUYV if negotiated natively.\n");
+        printf("Note: size=1280x720 may select a cropped sensor mode unless sensor= is explicitly used.\n");
         printf("YUV422/YUV444 are recognized but rejected: no direct internal planar 8-bit codec mapping in this UltraGrid tree.\n");
         printf("test: measured FPS support test.\n");
         printf("Use -t libcamera:fullhelp for parameter details and -t libcamera:caps for full capabilities.\n");
@@ -616,6 +729,38 @@ int parse_fmt(std::string_view fmt, libcamera_options *opts)
                         opts->sensor_width = sensor_size.width;
                         opts->sensor_height = sensor_size.height;
                         opts->sensor_set = true;
+                } else if (key == "hdr") {
+                        if (val.size() == strlen("off") &&
+                                        strncasecmp(val.data(), "off",
+                                                val.size()) == 0) {
+                                opts->hdr_set = true;
+                                opts->hdr_mode = libcamera_options::HdrMode::Off;
+                                opts->hdr_name = "off";
+                        } else if ((val.size() == strlen("auto") &&
+                                           strncasecmp(val.data(), "auto",
+                                                   val.size()) == 0) ||
+                                        (val.size() == strlen("sensor") &&
+                                                strncasecmp(val.data(), "sensor",
+                                                        val.size()) == 0)) {
+                                log_msg(LOG_LEVEL_ERROR,
+                                                MOD_NAME "hdr=%.*s is not "
+                                                "implemented yet; local "
+                                                "investigation shows sensor HDR "
+                                                "requires camera-specific "
+                                                "handling before libcamera mode "
+                                                "selection\n",
+                                                static_cast<int>(val.size()),
+                                                val.data());
+                                return VIDCAP_INIT_FAIL;
+                        } else {
+                                log_msg(LOG_LEVEL_ERROR,
+                                                MOD_NAME "unsupported hdr=%.*s; "
+                                                "supported value in this branch "
+                                                "is hdr=off\n",
+                                                static_cast<int>(val.size()),
+                                                val.data());
+                                return VIDCAP_INIT_FAIL;
+                        }
                 } else if (key == "mode") {
                         log_msg(LOG_LEVEL_ERROR,
                                         MOD_NAME "mode is not supported by "
@@ -623,7 +768,7 @@ int parse_fmt(std::string_view fmt, libcamera_options *opts)
                                         "size/fps/format\n");
                         return VIDCAP_INIT_FAIL;
                 } else if (key == "fps") {
-                        if (!parse_num(val, opts->fps) || opts->fps == 0) {
+                        if (!parse_fps(val, &opts->fps)) {
                                 log_msg(LOG_LEVEL_ERROR,
                                                 MOD_NAME "failed to parse fps\n");
                                 return VIDCAP_INIT_FAIL;
@@ -757,6 +902,27 @@ void print_common_yuv420_sizes(
         printf("  FPS: request with fps=N; exact support depends on camera/pipeline\n");
 }
 
+void print_known_sensor_caps(const std::shared_ptr<libcamera::Camera> &camera)
+{
+        const std::string model = camera_model_string(camera);
+        printf("  Camera model: %s\n", model.c_str());
+        if (!is_known_imx708_camera(model)) {
+                printf("  Known sensor mode caps: unavailable for this camera\n");
+                printf("  If sensor= is used, fps limits will be logged but not hard-failed.\n");
+                return;
+        }
+
+        printf("  Known sensor mode caps:\n");
+        for (const sensor_mode_cap &cap : imx708_sensor_caps) {
+                printf("    sensor=%s hdr=%s max_fps=%u (%s)\n",
+                                cap.sensor_size.toString().c_str(),
+                                cap.hdr_name, cap.max_fps, cap.note);
+        }
+        printf("  Note: size=1280x720 alone may select the cropped 1536x864 sensor mode.\n");
+        printf("  Example full-FOV-ish 720p56: -t libcamera:d=0:sensor=2304x1296:size=1280x720:fps=56:format=YUV420\n");
+        printf("  Example cropped 720p60+: -t libcamera:d=0:sensor=1536x864:size=1280x720:fps=60:format=YUV420\n");
+}
+
 bool print_camera_help(const std::shared_ptr<libcamera::Camera> &camera,
                 size_t index)
 {
@@ -781,6 +947,7 @@ bool print_camera_help(const std::shared_ptr<libcamera::Camera> &camera,
                                         stream_config.pixelFormat.toString().c_str(),
                                         stream_config.size.toString().c_str());
                         print_common_yuv420_sizes(stream_config);
+                        print_known_sensor_caps(camera);
                         success = true;
                 }
         }
@@ -808,6 +975,8 @@ bool inspect_camera_caps(const std::shared_ptr<libcamera::Camera> &camera)
                 } else {
                         libcamera::StreamConfiguration &stream_config =
                                 config->at(0);
+                        printf("Device %s\n", camera->id().c_str());
+                        print_known_sensor_caps(camera);
                         log_stream_config("generated stream", stream_config);
                         log_stream_formats(stream_config);
                         success = true;
@@ -892,10 +1061,11 @@ bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
                         opts.format_name.c_str(), get_codec_name(opts.codec));
 
         if (opts.size_set || opts.sensor_set || opts.format_set ||
-                        opts.fps_set) {
+                        opts.fps_set || opts.hdr_set) {
                 log_msg(LOG_LEVEL_INFO,
                                 MOD_NAME "requested overrides: size=%s "
-                                "sensor=%s format=%s fps=%s bufferCount=%u\n",
+                                "sensor=%s format=%s fps=%s hdr=%s "
+                                "bufferCount=%u\n",
                                 check_requested_size ?
                                         effective_requested_size.toString().c_str() :
                                         "default",
@@ -906,11 +1076,12 @@ bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
                                         requested_pixfmt.toString().c_str() :
                                         "default",
                                 opts.fps_set ? "set" : "default",
+                                opts.hdr_set ? opts.hdr_name.c_str() : "default",
                                 stream_config.bufferCount);
         }
         if (opts.fps_set) {
                 log_msg(LOG_LEVEL_INFO,
-                                MOD_NAME "requested fps=%u; will apply during "
+                                MOD_NAME "requested fps=%.3f; will apply during "
                                 "camera start if supported\n",
                                 opts.fps);
         }
@@ -943,6 +1114,55 @@ bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
                 log_msg(LOG_LEVEL_ERROR,
                                 MOD_NAME "requested configuration is invalid\n");
                 return false;
+        }
+        if (opts.sensor_set && config->sensorConfig) {
+                const std::string camera_model = camera_model_string(s->camera);
+                const libcamera::Size validated_sensor_size =
+                        config->sensorConfig->outputSize;
+                const sensor_mode_cap *cap = find_known_sensor_cap(s->camera,
+                                validated_sensor_size, opts.hdr_mode);
+                if (cap != nullptr && opts.fps_set &&
+                                opts.fps > cap->max_fps + 0.001) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "requested fps=%.3f exceeds "
+                                        "max_fps=%u for sensor=%s hdr=%s on "
+                                        "%s.\n",
+                                        opts.fps, cap->max_fps,
+                                        validated_sensor_size.toString().c_str(),
+                                        hdr_mode_to_string(opts.hdr_mode),
+                                        camera_model.c_str());
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "Use fps=%u, choose a faster "
+                                        "cropped sensor mode such as "
+                                        "sensor=1536x864, or use a different "
+                                        "camera.\n",
+                                        cap->max_fps);
+                        return false;
+                }
+                if (cap == nullptr) {
+                        if (is_known_imx708_camera(camera_model)) {
+                                log_msg(LOG_LEVEL_WARNING,
+                                                MOD_NAME "no known max_fps cap "
+                                                "for sensor=%s hdr=%s on %s; "
+                                                "not rejecting requested fps\n",
+                                                validated_sensor_size.toString().c_str(),
+                                                hdr_mode_to_string(opts.hdr_mode),
+                                                camera_model.c_str());
+                        } else {
+                                log_msg(LOG_LEVEL_WARNING,
+                                                MOD_NAME "fps caps are not "
+                                                "known for camera %s; not "
+                                                "rejecting requested fps\n",
+                                                camera_model.c_str());
+                        }
+                } else {
+                        log_msg(LOG_LEVEL_INFO,
+                                        MOD_NAME "known sensor cap: sensor=%s "
+                                        "hdr=%s max_fps=%u (%s)\n",
+                                        validated_sensor_size.toString().c_str(),
+                                        cap->hdr_name, cap->max_fps,
+                                        cap->note);
+                }
         }
         if (stream_config.pixelFormat != requested_pixfmt) {
                 if (check_requested_format) {
@@ -1509,7 +1729,7 @@ int run_fps_test(const libcamera_options &opts)
 
         if (opts.fps_set) {
                 log_msg(LOG_LEVEL_WARNING,
-                                MOD_NAME "test mode: fps=%u limits test to "
+                                MOD_NAME "test mode: fps=%.3f limits test to "
                                 "that single value\n",
                                 opts.fps);
         }
@@ -1534,7 +1754,8 @@ int run_fps_test(const libcamera_options &opts)
                 24, 25, 30, 50, 60, 75, 90, 100, 120,
         };
         const std::vector<unsigned int> fps_values =
-                opts.fps_set ? std::vector<unsigned int>{ opts.fps } :
+                opts.fps_set ? std::vector<unsigned int>{
+                        static_cast<unsigned int>(std::llround(opts.fps)) } :
                 default_fps;
 
         std::vector<fps_test_result> results;
@@ -1679,6 +1900,7 @@ int vidcap_libcamera_init(const struct vidcap_params *params, void **state)
                         for (size_t i = 0; i < cameras.size(); ++i) {
                                 printf("Device %zu) %s\n", i,
                                                 cameras[i]->id().c_str());
+                                print_known_sensor_caps(cameras[i]);
                         }
                         have_config = true;
                 } else if (opts.action == libcamera_options::Action::Caps) {
