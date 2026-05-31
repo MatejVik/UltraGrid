@@ -97,8 +97,11 @@ struct libcamera_options {
         } action = Action::Run;
         size_t camera_index = 0;
         libcamera::Size size = {};
+        unsigned int sensor_width = 0;
+        unsigned int sensor_height = 0;
         unsigned int fps = 0;
         bool size_set = false;
+        bool sensor_set = false;
         bool fps_set = false;
         bool format_set = false;
         std::string format_name = "YUV420";
@@ -145,6 +148,21 @@ bool is_format_available(
 bool is_packed_422(codec_t codec)
 {
         return codec == UYVY || codec == YUYV;
+}
+
+bool parse_size(std::string_view val, libcamera::Size *size)
+{
+        auto width = tokenize(val, 'x', '"');
+        auto height = tokenize(val, 'x', '"');
+        unsigned int parsed_width = 0;
+        unsigned int parsed_height = 0;
+        if (!parse_num(width, parsed_width) ||
+                        !parse_num(height, parsed_height) || !val.empty() ||
+                        parsed_width == 0 || parsed_height == 0) {
+                return false;
+        }
+        *size = { parsed_width, parsed_height };
+        return true;
 }
 
 void log_stream_config(const char *label,
@@ -496,7 +514,7 @@ void print_usage()
 {
         printf("libcamera capture\n");
         printf("Usage:\n");
-        printf("\t-t libcamera[:d=<index>|camera=<index>][:size=WxH][:fps=N][:format=YUV420|I420|UYVY|YUYV][:list|caps|test|help|fullhelp]\n");
+        printf("\t-t libcamera[:d=<index>|camera=<index>][:sensor=WxH][:size=WxH][:fps=N][:format=YUV420|I420|UYVY|YUYV][:list|caps|test|help|fullhelp]\n");
         printf("\n");
 }
 
@@ -506,6 +524,7 @@ void show_fullhelp()
         printf("Without overrides, libcamera's default VideoRecording configuration is used.\n");
         printf("d=<index>, camera=<index> select a libcamera device; both names are aliases.\n");
         printf("size=WxH selects the output stream size.\n");
+        printf("sensor=WxH optionally requests the libcamera sensor output size before ISP scaling.\n");
         printf("fps=N requests frame rate through FrameDurationLimits when streaming starts.\n");
         printf("format=YUV420 selects planar 4:2:0 and maps to UltraGrid I420. I420 is an alias.\n");
         printf("format=UYVY and format=YUYV select packed 8-bit 4:2:2 handoff if libcamera can negotiate them natively.\n");
@@ -514,7 +533,7 @@ void show_fullhelp()
         printf("list prints only available cameras.\n");
         printf("caps prints detailed libcamera StreamFormats and may be long.\n");
         printf("test runs a short measured FPS support test for typical values 24..120.\n");
-        printf("test respects d/camera, size and format; fps=N limits test to that single FPS value.\n");
+        printf("test respects d/camera, sensor, size and format; fps=N limits test to that single FPS value.\n");
         printf("test is diagnostic only and does not use the UltraGrid frame handoff path.\n");
         printf("testverbose keeps libcamera diagnostic logs enabled while running the FPS test.\n");
         printf("help prints a compact device and output-size overview.\n");
@@ -530,6 +549,7 @@ void show_help_header()
         printf("Examples:\n");
         printf("\t-t libcamera\n");
         printf("\t-t libcamera:d=0:size=1280x720:fps=50:format=YUV420\n");
+        printf("\t-t libcamera:d=0:sensor=2304x1296:size=1280x720:fps=60:format=YUV420\n");
         printf("\t-t libcamera:d=0:size=1280x720:fps=50:format=UYVY\n");
         printf("\t-t libcamera:list\n");
         printf("\t-t libcamera:caps\n");
@@ -575,20 +595,27 @@ int parse_fmt(std::string_view fmt, libcamera_options *opts)
                                 return VIDCAP_INIT_FAIL;
                         }
                 } else if (key == "size") {
-                        auto width = tokenize(val, 'x', '"');
-                        auto height = tokenize(val, 'x', '"');
-                        unsigned int parsed_width = 0;
-                        unsigned int parsed_height = 0;
-                        if (!parse_num(width, parsed_width) ||
-                                        !parse_num(height, parsed_height) ||
-                                        !val.empty() || parsed_width == 0 ||
-                                        parsed_height == 0) {
+                        if (!parse_size(val, &opts->size)) {
                                 log_msg(LOG_LEVEL_ERROR,
                                                 MOD_NAME "failed to parse size\n");
                                 return VIDCAP_INIT_FAIL;
                         }
-                        opts->size = { parsed_width, parsed_height };
                         opts->size_set = true;
+                } else if (key == "sensor") {
+                        libcamera::Size sensor_size = {};
+                        if (!parse_size(val, &sensor_size) ||
+                                        sensor_size.width % 2 != 0 ||
+                                        sensor_size.height % 2 != 0) {
+                                log_msg(LOG_LEVEL_ERROR,
+                                                MOD_NAME "failed to parse "
+                                                "sensor size; expected "
+                                                "sensor=WxH with positive "
+                                                "even dimensions\n");
+                                return VIDCAP_INIT_FAIL;
+                        }
+                        opts->sensor_width = sensor_size.width;
+                        opts->sensor_height = sensor_size.height;
+                        opts->sensor_set = true;
                 } else if (key == "mode") {
                         log_msg(LOG_LEVEL_ERROR,
                                         MOD_NAME "mode is not supported by "
@@ -834,8 +861,28 @@ bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
                 }
                 stream_config.pixelFormat = requested_pixfmt;
         }
+        if (opts.sensor_set) {
+                libcamera::SensorConfiguration sensor_config = {};
+                sensor_config.outputSize = {
+                        opts.sensor_width,
+                        opts.sensor_height,
+                };
+                sensor_config.bitDepth = 10;
+                config->sensorConfig = sensor_config;
+        }
         if (stream_config.bufferCount < 4) {
                 stream_config.bufferCount = 4;
+        }
+
+        log_msg(LOG_LEVEL_INFO,
+                        MOD_NAME "requested stream: size=%s pixelFormat=%s\n",
+                        stream_config.size.toString().c_str(),
+                        stream_config.pixelFormat.toString().c_str());
+        if (opts.sensor_set) {
+                log_msg(LOG_LEVEL_INFO,
+                                MOD_NAME "requested sensor output: %ux%u "
+                                "bitDepth=10\n",
+                                opts.sensor_width, opts.sensor_height);
         }
 
         log_msg(LOG_LEVEL_INFO,
@@ -844,12 +891,16 @@ bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
                         requested_pixfmt.toString().c_str(),
                         opts.format_name.c_str(), get_codec_name(opts.codec));
 
-        if (opts.size_set || opts.format_set || opts.fps_set) {
+        if (opts.size_set || opts.sensor_set || opts.format_set ||
+                        opts.fps_set) {
                 log_msg(LOG_LEVEL_INFO,
                                 MOD_NAME "requested overrides: size=%s "
-                                "format=%s fps=%s bufferCount=%u\n",
+                                "sensor=%s format=%s fps=%s bufferCount=%u\n",
                                 check_requested_size ?
                                         effective_requested_size.toString().c_str() :
+                                        "default",
+                                opts.sensor_set ?
+                                        config->sensorConfig->outputSize.toString().c_str() :
                                         "default",
                                 check_requested_format ?
                                         requested_pixfmt.toString().c_str() :
@@ -868,6 +919,21 @@ bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
         log_msg(LOG_LEVEL_INFO, MOD_NAME "configuration validation: %s\n",
                         validation_status_to_string(status));
         log_stream_config("validated stream", stream_config);
+        log_msg(LOG_LEVEL_INFO,
+                        MOD_NAME "validated stream: size=%s pixelFormat=%s\n",
+                        stream_config.size.toString().c_str(),
+                        stream_config.pixelFormat.toString().c_str());
+        if (config->sensorConfig) {
+                log_msg(LOG_LEVEL_INFO,
+                                MOD_NAME "validated sensor output: %s "
+                                "bitDepth=%u analogCrop=%s\n",
+                                config->sensorConfig->outputSize.toString().c_str(),
+                                config->sensorConfig->bitDepth,
+                                config->sensorConfig->analogCrop.toString().c_str());
+        } else if (opts.sensor_set) {
+                log_msg(LOG_LEVEL_INFO,
+                                MOD_NAME "validated sensor output: none\n");
+        }
         log_msg(LOG_LEVEL_INFO,
                         MOD_NAME "negotiated libcamera pixel format after "
                         "validate: %s\n",
@@ -1131,6 +1197,15 @@ bool configure_test_stream(libcamera::Camera *camera,
                 return false;
         }
         stream_config.pixelFormat = opts.pixel_format;
+        if (opts.sensor_set) {
+                libcamera::SensorConfiguration sensor_config = {};
+                sensor_config.outputSize = {
+                        opts.sensor_width,
+                        opts.sensor_height,
+                };
+                sensor_config.bitDepth = 10;
+                config->sensorConfig = sensor_config;
+        }
         if (stream_config.bufferCount < 4) {
                 stream_config.bufferCount = 4;
         }
