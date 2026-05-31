@@ -1813,6 +1813,37 @@ struct to_lavc_vid_conv *to_lavc_vid_conv_init(codec_t in_pixfmt, int width, int
         return s;
 };
 
+static const char *
+to_lavc_vid_conv_callback_name(pixfmt_callback_t callback)
+{
+        if (callback == uyvy_to_yuv422p) {
+                return "uyvy_to_yuv422p";
+        }
+        return callback != NULL ? "other" : "none";
+}
+
+void
+to_lavc_vid_conv_get_info(const struct to_lavc_vid_conv *s,
+                          struct to_lavc_vid_conv_info *info)
+{
+        if (s == NULL || info == NULL) {
+                return;
+        }
+        *info = (struct to_lavc_vid_conv_info) {
+                .in_pixfmt = s->in_pixfmt,
+                .intermediate_codec = s->decoded_codec,
+                .out_pixfmt = s->out_frame->format,
+                .uses_uv_decoder = s->decoder != vc_memcpy,
+                .uses_av_pixfmt_callback = s->pixfmt_conv_callback != NULL,
+                .uses_cuda = s->cuda_conv_state != NULL,
+                .avframe_buffers_reused = true,
+                .avframe_allocated_per_frame = false,
+                .conversion_name =
+                        to_lavc_vid_conv_callback_name(
+                                s->pixfmt_conv_callback),
+        };
+}
+
 // frame has some linesizes as mapped ultragrid equivalent pixfmt
 static bool same_linesizes(codec_t codec, AVFrame *frame)
 {

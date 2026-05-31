@@ -37,11 +37,13 @@
 
 #define __STDC_CONSTANT_MACROS
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cinttypes>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>                        // for strcmp, strlen, strstr, strchr
 #include <functional>                     // for function
 #include <libavutil/rational.h>           // for av_inv_q
@@ -81,8 +83,14 @@
 #ifdef HWACC_VAAPI
 extern "C"
 {
+#include <libavutil/imgutils.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_vaapi.h>
+}
+#else
+extern "C"
+{
+#include <libavutil/imgutils.h>
 }
 #endif
 #include "hwaccel_libav_common.h"
@@ -307,8 +315,171 @@ struct state_video_compress_libav {
         time_ns_t duration_warn_last_print = 0;
         int64_t   max_pts_diff_reported    = 0;
 
+        bool      lavc_profile_enabled = false;
+        time_ns_t lavc_profile_window_start = 0;
+        uint64_t  lavc_profile_frames = 0;
+        uint64_t  lavc_profile_bytes_read = 0;
+        uint64_t  lavc_profile_bytes_written = 0;
+        uint64_t  lavc_profile_total_ns = 0;
+        uint64_t  lavc_profile_max_ns = 0;
+        AVPixelFormat lavc_profile_selected_pixfmt = AV_PIX_FMT_NONE;
+        string    lavc_profile_encoder;
+
         map<int64_t, char[VF_METADATA_SIZE]> metadata_storage;
 };
+
+static bool
+lavc_profile_enabled_env()
+{
+        const char *env = getenv("UG_LAVC_PROFILE");
+        return env != nullptr && strcmp(env, "0") != 0;
+}
+
+static const char *
+lavc_profile_pix_fmt_name(AVPixelFormat pix_fmt)
+{
+        const char *name = av_get_pix_fmt_name(pix_fmt);
+        return name != nullptr ? name : "unknown";
+}
+
+static void
+lavc_profile_reset_window(struct state_video_compress_libav *s)
+{
+        s->lavc_profile_window_start = get_time_in_ns();
+        s->lavc_profile_frames = 0;
+        s->lavc_profile_bytes_read = 0;
+        s->lavc_profile_bytes_written = 0;
+        s->lavc_profile_total_ns = 0;
+        s->lavc_profile_max_ns = 0;
+}
+
+static bool
+lavc_profile_is_packed422(codec_t codec)
+{
+        return codec == UYVY || codec == YUYV;
+}
+
+static bool
+lavc_profile_is_planar422(AVPixelFormat pix_fmt)
+{
+        return pix_fmt == AV_PIX_FMT_YUV422P ||
+               pix_fmt == AV_PIX_FMT_YUVJ422P;
+}
+
+static size_t
+lavc_profile_av_image_size(AVPixelFormat pix_fmt, int width, int height)
+{
+        const int size = av_image_get_buffer_size(pix_fmt, width, height, 1);
+        return size > 0 ? (size_t) size : 0;
+}
+
+static void
+lavc_profile_account(struct state_video_compress_libav *s,
+                     size_t input_bytes, bool direct_input_planes,
+                     time_ns_t prepare_ns)
+{
+        if (!s->lavc_profile_enabled) {
+                return;
+        }
+
+        struct to_lavc_vid_conv_info conv_info = {};
+        to_lavc_vid_conv_get_info(s->pixfmt_conversion, &conv_info);
+
+        const size_t intermediate_bytes =
+                conv_info.intermediate_codec != VIDEO_CODEC_NONE ?
+                vc_get_datalen(s->saved_desc.width, s->saved_desc.height,
+                               conv_info.intermediate_codec) : 0;
+        const size_t converter_av_bytes =
+                lavc_profile_av_image_size(conv_info.out_pixfmt,
+                                s->saved_desc.width, s->saved_desc.height);
+        const size_t selected_av_bytes =
+                lavc_profile_av_image_size(s->lavc_profile_selected_pixfmt,
+                                s->saved_desc.width, s->saved_desc.height);
+
+        size_t bytes_read = 0;
+        size_t bytes_written = 0;
+        if (!direct_input_planes) {
+                if (conv_info.uses_uv_decoder) {
+                        bytes_read += input_bytes;
+                        bytes_written += intermediate_bytes;
+                        bytes_read += intermediate_bytes;
+                } else {
+                        bytes_read += input_bytes;
+                }
+                if (conv_info.uses_av_pixfmt_callback) {
+                        bytes_written += converter_av_bytes;
+                } else {
+                        bytes_written += selected_av_bytes;
+                }
+        }
+#ifdef HAVE_SWSCALE
+        if (s->sws_ctx) {
+                bytes_read += converter_av_bytes;
+                bytes_written += selected_av_bytes;
+        }
+#endif
+
+        s->lavc_profile_frames += 1;
+        s->lavc_profile_bytes_read += bytes_read;
+        s->lavc_profile_bytes_written += bytes_written;
+        s->lavc_profile_total_ns += prepare_ns;
+        s->lavc_profile_max_ns =
+                std::max<uint64_t>(s->lavc_profile_max_ns, prepare_ns);
+
+        const time_ns_t now = get_time_in_ns();
+        const double elapsed =
+                (now - s->lavc_profile_window_start) / NS_IN_SEC_DBL;
+        if (elapsed < 5.0 || s->lavc_profile_frames == 0) {
+                return;
+        }
+
+        const bool packed422_unpack =
+                lavc_profile_is_packed422(s->saved_desc.color_spec) &&
+                lavc_profile_is_planar422(s->lavc_profile_selected_pixfmt) &&
+                conv_info.uses_av_pixfmt_callback;
+        const bool internal_conv = conv_info.uses_uv_decoder;
+        const char *intermediate_name =
+                internal_conv ? get_codec_name(conv_info.intermediate_codec) :
+                                "none";
+
+        log_msg(LOG_LEVEL_INFO,
+                        "[lavc profile] ug=%s size=%ux%u av=%s encoder=%s "
+                        "swscale=%s direct_plane_copy=%s packed422_unpack=%s "
+                        "ug_internal_conv=%s intermediate=%s conv=%s "
+                        "avg_prepare_ms=%.3f max_prepare_ms=%.3f "
+                        "read_MBps=%.2f written_MBps=%.2f "
+                        "avframe_buffers=%s per_frame_alloc=%s frames=%" PRIu64
+                        "\n",
+                        get_codec_name(s->saved_desc.color_spec),
+                        s->saved_desc.width, s->saved_desc.height,
+                        lavc_profile_pix_fmt_name(
+                                s->lavc_profile_selected_pixfmt),
+                        s->lavc_profile_encoder.c_str(),
+#ifdef HAVE_SWSCALE
+                        s->sws_ctx ? "yes" : "no",
+#else
+                        "no",
+#endif
+                        direct_input_planes ? "yes" : "no",
+                        packed422_unpack ? "yes" : "no",
+                        internal_conv ? "yes" : "no",
+                        intermediate_name,
+                        conv_info.conversion_name,
+                        (s->lavc_profile_total_ns /
+                                        (double) s->lavc_profile_frames) /
+                                1000000.0,
+                        s->lavc_profile_max_ns / 1000000.0,
+                        (s->lavc_profile_bytes_read / elapsed) /
+                                (1024.0 * 1024.0),
+                        (s->lavc_profile_bytes_written / elapsed) /
+                                (1024.0 * 1024.0),
+                        conv_info.avframe_buffers_reused ? "reused" :
+                                                           "unknown",
+                        conv_info.avframe_allocated_per_frame ? "yes" : "no",
+                        s->lavc_profile_frames);
+
+        lavc_profile_reset_window(s);
+}
 
 struct codec_encoders_decoders{
         std::vector<std::string> encoders;
@@ -697,6 +868,8 @@ void* libavcodec_compress_init(struct module *parent, const char *opts)
 
         char *fmt = strdup(opts);
         struct state_video_compress_libav *s = new state_video_compress_libav(parent);
+        s->lavc_profile_enabled = lavc_profile_enabled_env();
+        lavc_profile_reset_window(s);
         int ret = -1;
         try {
                 ret = parse_fmt(s, fmt);
@@ -1232,6 +1405,7 @@ static bool configure_with(struct state_video_compress_libav *s, struct video_de
         }
         log_msg(LOG_LEVEL_NOTICE, "[lavc] Using codec: %s, encoder: %s\n",
                         get_codec_name(ug_codec), codec->name);
+        s->lavc_profile_encoder = codec->name;
 
         // Try to open the codec context
         // It is done in a loop because some pixel formats that are reported
@@ -1292,6 +1466,8 @@ static bool configure_with(struct state_video_compress_libav *s, struct video_de
                         return false;
                 }
         }
+        s->lavc_profile_selected_pixfmt = pix_fmt;
+        lavc_profile_reset_window(s);
 
         // we need to store extradata for HuffYUV/FFV1 in the beginning
         if (libav_codec_has_extradata(ug_codec)) {
@@ -1552,6 +1728,8 @@ static shared_ptr<video_frame> libavcodec_compress_tile(void *state, shared_ptr<
                 return {};
         }
         time_ns_t t1 = get_time_in_ns();
+        const bool direct_input_planes =
+                frame->data[0] == (uint8_t *) tx->tiles[0].data;
 
         debug_file_dump("lavc-avframe", serialize_video_avframe, frame);
 #ifdef HWACC_VAAPI
@@ -1574,6 +1752,8 @@ static shared_ptr<video_frame> libavcodec_compress_tile(void *state, shared_ptr<
         }
 #endif //HAVE_SWSCALE
         time_ns_t t2 = get_time_in_ns();
+        lavc_profile_account(s, tx->tiles[0].data_len, direct_input_planes,
+                             t2 - t0);
 
         /* encode the image */
         frame->pts = s->cur_pts++;

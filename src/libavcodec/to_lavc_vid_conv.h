@@ -44,13 +44,28 @@
 #include "libavcodec/lavc_common.h"
 #include "types.h"             // for codec_t
 
+#include <stdbool.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 struct to_lavc_vid_conv;
+struct to_lavc_vid_conv_info {
+        codec_t in_pixfmt;
+        codec_t intermediate_codec;
+        enum AVPixelFormat out_pixfmt;
+        bool uses_uv_decoder;
+        bool uses_av_pixfmt_callback;
+        bool uses_cuda;
+        bool avframe_buffers_reused;
+        bool avframe_allocated_per_frame;
+        const char *conversion_name;
+};
 struct to_lavc_vid_conv *to_lavc_vid_conv_init(codec_t in_pixfmt, int width, int height, enum AVPixelFormat out_pixfmt, int thread_count);
 struct AVFrame *to_lavc_vid_conv(struct to_lavc_vid_conv *state, char *in_data);
+void to_lavc_vid_conv_get_info(const struct to_lavc_vid_conv *state,
+                               struct to_lavc_vid_conv_info *info);
 void to_lavc_vid_conv_destroy(struct to_lavc_vid_conv **state);
 
 struct to_lavc_req_prop {
@@ -75,4 +90,3 @@ void get_av_pixfmt_details(enum AVPixelFormat av_codec, enum AVColorSpace *color
 #endif
 
 #endif // !defined LIBAVCODEC_TO_LAVC_VID_CONV_0C22E28C_A3F1_489D_87DC_E56D76E3598B
-
