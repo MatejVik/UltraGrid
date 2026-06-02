@@ -66,6 +66,7 @@
 #include <libcamera/framebuffer_allocator.h>
 #include <libcamera/libcamera.h>
 #include <libcamera/formats.h>
+#include <libcamera/property_ids.h>
 
 #include "debug.h"
 #include "lib_common.h"
@@ -99,6 +100,23 @@ const char *validation_status_to_string(libcamera::CameraConfiguration::Status s
                         Sensor,
                 };
 
+                enum class AfSpeed {
+                        Normal,
+                        Fast,
+                };
+
+                enum class AfRange {
+                        Normal,
+                        Macro,
+                        Full,
+                };
+
+                enum class NightMode {
+                        Off,
+                        Ir,
+                        Lowlight,
+                };
+
         enum class Action {
                 Run,
                 Help,
@@ -120,6 +138,36 @@ const char *validation_status_to_string(libcamera::CameraConfiguration::Status s
                 std::string format_name = "YUV420";
                 std::string hdr_name = "unset";
                 HdrMode hdr_mode = HdrMode::Off;
+                bool focus_set = false;
+                bool focus_afc = false;
+                bool focus_manual = false;
+                bool focus_m_set = false;
+                bool focus_m_inf = false;
+                bool af_speed_set = false;
+                bool af_range_set = false;
+                bool af_area_set = false;
+                bool night_set = false;
+                bool ae_set = false;
+                bool ae_enable = false;
+                bool metering_set = false;
+                bool ae_diag_set = false;
+                unsigned int ae_diag_interval = 30;
+                bool ev_set = false;
+                float ev = 0.0f;
+                bool brightness_set = false;
+                float brightness = 0.0f;
+                bool saturation_set = false;
+                float saturation = 1.0f;
+                bool contrast_set = false;
+                float contrast = 1.0f;
+                double focus_m = 0.0;
+                AfSpeed af_speed = AfSpeed::Normal;
+                AfRange af_range = AfRange::Normal;
+                NightMode night_mode = NightMode::Off;
+                std::string af_area_name;
+                std::string night_name;
+                int32_t metering_mode = libcamera::controls::MeteringCentreWeighted;
+                std::string metering_name;
         libcamera::PixelFormat pixel_format = libcamera::formats::YUV420;
         codec_t codec = I420;
         bool test_verbose = false;
@@ -150,11 +198,25 @@ struct libcamera_format_mapping {
         codec_t codec;
 };
 
+struct af_area_preset {
+        const char *name;
+        double x;
+        double y;
+        double width;
+        double height;
+};
+
 const libcamera_format_mapping supported_formats[] = {
         { "YUV420", libcamera::formats::YUV420, I420 },
         { "I420", libcamera::formats::YUV420, I420 },
         { "UYVY", libcamera::formats::UYVY, UYVY },
         { "YUYV", libcamera::formats::YUYV, YUYV },
+};
+
+const af_area_preset af_area_presets[] = {
+        { "full", 0.0, 0.0, 1.0, 1.0 },
+        { "mid", 0.25, 0.25, 0.5, 0.5 },
+        { "center", 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0 },
 };
 
 const libcamera_format_mapping *find_supported_format(std::string_view name)
@@ -164,6 +226,18 @@ const libcamera_format_mapping *find_supported_format(std::string_view name)
                                 strncasecmp(name.data(), mapping.name,
                                         name.size()) == 0) {
                         return &mapping;
+                }
+        }
+        return nullptr;
+}
+
+const af_area_preset *find_af_area_preset(std::string_view name)
+{
+        for (const af_area_preset &preset : af_area_presets) {
+                if (name.size() == strlen(preset.name) &&
+                                strncasecmp(name.data(), preset.name,
+                                        name.size()) == 0) {
+                        return &preset;
                 }
         }
         return nullptr;
@@ -488,24 +562,27 @@ bool resolve_and_apply_hdr_mode(libcamera_options *opts,
                 bool *wdr_changed)
 {
         *wdr_changed = false;
-        if (!opts->hdr_set) {
-                return true;
-        }
         const std::string model = camera_model_string(camera);
         const bool is_imx708 = is_known_imx708_camera(model);
+        const bool enable_sensor_hdr = opts->hdr_set &&
+                opts->hdr_mode == libcamera_options::HdrMode::Sensor;
 
         log_msg(LOG_LEVEL_INFO,
                         MOD_NAME "selected camera model/id: %s / %s\n",
                         model.c_str(), camera->id().c_str());
-        log_msg(LOG_LEVEL_INFO,
-                        MOD_NAME "requested HDR mode: %s\n",
-                        opts->hdr_name.c_str());
+        if (opts->hdr_set) {
+                log_msg(LOG_LEVEL_INFO,
+                                MOD_NAME "requested HDR mode: %s\n",
+                                opts->hdr_name.c_str());
+                log_msg(LOG_LEVEL_INFO,
+                                MOD_NAME "resolved HDR mode: %s\n",
+                                hdr_mode_to_string(opts->hdr_mode));
+        } else {
+                log_msg(LOG_LEVEL_INFO,
+                                MOD_NAME "HDR not requested; ensuring SDR/WDR off\n");
+        }
 
-        log_msg(LOG_LEVEL_INFO,
-                        MOD_NAME "resolved HDR mode: %s\n",
-                        hdr_mode_to_string(opts->hdr_mode));
-
-        if (opts->hdr_mode == libcamera_options::HdrMode::Sensor && !is_imx708) {
+        if (enable_sensor_hdr && !is_imx708) {
                 log_msg(LOG_LEVEL_ERROR,
                                 MOD_NAME "hdr is currently supported only for "
                                 "known IMX708 cameras; got %s\n",
@@ -517,7 +594,7 @@ bool resolve_and_apply_hdr_mode(libcamera_options *opts,
                 return true;
         }
 
-        if (opts->hdr_mode == libcamera_options::HdrMode::Sensor) {
+        if (enable_sensor_hdr) {
                 const libcamera::Size hdr_sensor_size = { 2304, 1296 };
                 if (opts->sensor_set) {
                         const libcamera::Size requested_sensor_size(
@@ -540,8 +617,6 @@ bool resolve_and_apply_hdr_mode(libcamera_options *opts,
                 }
         }
 
-        const bool enable_sensor_hdr =
-                opts->hdr_mode == libcamera_options::HdrMode::Sensor;
         return set_imx708_wdr_control(camera, enable_sensor_hdr, wdr_changed);
 }
 
@@ -620,6 +695,7 @@ struct vidcap_libcamera_state {
         std::map<libcamera::FrameBuffer *, mapped_buffer> mapped_buffers;
         libcamera::Stream *stream = nullptr;
         libcamera::StreamConfiguration stream_config = {};
+        libcamera_options opts = {};
         struct video_desc desc = {};
         struct video_frame *frame = nullptr;
         std::mutex lock;
@@ -630,6 +706,13 @@ struct vidcap_libcamera_state {
         bool camera_acquired = false;
         bool stopping = false;
         unsigned int copied_frames = 0;
+        unsigned int ae_diag_completed_frames = 0;
+        std::chrono::steady_clock::time_point last_ae_ceiling_log = {};
+        std::chrono::steady_clock::time_point last_focus_metadata_log = {};
+        std::optional<int32_t> last_metadata_af_mode;
+        std::optional<float> last_metadata_lens_position;
+        std::optional<int32_t> last_metadata_af_state;
+        std::optional<int32_t> last_metadata_focus_fom;
 
         void request_completed(libcamera::Request *request)
         {
@@ -799,6 +882,715 @@ bool setup_mmaps_and_requests(vidcap_libcamera_state *s)
         return true;
 }
 
+const char *af_speed_to_string(libcamera_options::AfSpeed speed)
+{
+        switch (speed) {
+        case libcamera_options::AfSpeed::Normal:
+                return "normal";
+        case libcamera_options::AfSpeed::Fast:
+                return "fast";
+        }
+        return "unknown";
+}
+
+const char *af_range_to_string(libcamera_options::AfRange range)
+{
+        switch (range) {
+        case libcamera_options::AfRange::Normal:
+                return "normal";
+        case libcamera_options::AfRange::Macro:
+                return "macro";
+        case libcamera_options::AfRange::Full:
+                return "full";
+        }
+        return "unknown";
+}
+
+const char *night_mode_to_string(libcamera_options::NightMode mode)
+{
+        switch (mode) {
+        case libcamera_options::NightMode::Off:
+                return "off";
+        case libcamera_options::NightMode::Ir:
+                return "ir";
+        case libcamera_options::NightMode::Lowlight:
+                return "lowlight";
+        }
+        return "unknown";
+}
+
+const char *metering_mode_to_string(int32_t mode)
+{
+        switch (mode) {
+        case libcamera::controls::MeteringCentreWeighted:
+                return "centre";
+        case libcamera::controls::MeteringSpot:
+                return "spot";
+        case libcamera::controls::MeteringMatrix:
+                return "matrix";
+        }
+        return "unknown";
+}
+
+const char *af_mode_to_string(int32_t mode)
+{
+        switch (mode) {
+        case libcamera::controls::AfModeManual:
+                return "manual";
+        case libcamera::controls::AfModeAuto:
+                return "auto";
+        case libcamera::controls::AfModeContinuous:
+                return "continuous";
+        }
+        return "unknown";
+}
+
+const char *af_state_to_string(int32_t state)
+{
+        switch (state) {
+        case libcamera::controls::AfStateIdle:
+                return "idle";
+        case libcamera::controls::AfStateScanning:
+                return "scanning";
+        case libcamera::controls::AfStateFocused:
+                return "focused";
+        case libcamera::controls::AfStateFailed:
+                return "failed";
+        }
+        return "unknown";
+}
+
+const char *ae_state_to_string(int32_t state)
+{
+        switch (state) {
+        case libcamera::controls::AeStateIdle:
+                return "idle";
+        case libcamera::controls::AeStateSearching:
+                return "searching";
+        case libcamera::controls::AeStateConverged:
+                return "converged";
+        }
+        return "unknown";
+}
+
+bool parse_on_off(std::string_view val, bool *enabled)
+{
+        if (val.size() == strlen("on") &&
+                        strncasecmp(val.data(), "on", val.size()) == 0) {
+                *enabled = true;
+                return true;
+        }
+        if (val.size() == strlen("off") &&
+                        strncasecmp(val.data(), "off", val.size()) == 0) {
+                *enabled = false;
+                return true;
+        }
+        return false;
+}
+
+bool parse_night_mode(std::string_view val, libcamera_options *opts)
+{
+        if (val.size() == strlen("off") &&
+                        strncasecmp(val.data(), "off", val.size()) == 0) {
+                opts->night_set = true;
+                opts->night_mode = libcamera_options::NightMode::Off;
+                opts->night_name = "off";
+                return true;
+        }
+        if (val.size() == strlen("ir") &&
+                        strncasecmp(val.data(), "ir", val.size()) == 0) {
+                opts->night_set = true;
+                opts->night_mode = libcamera_options::NightMode::Ir;
+                opts->night_name = "ir";
+                return true;
+        }
+        if (val.size() == strlen("lowlight") &&
+                        strncasecmp(val.data(), "lowlight",
+                                val.size()) == 0) {
+                opts->night_set = true;
+                opts->night_mode = libcamera_options::NightMode::Lowlight;
+                opts->night_name = "lowlight";
+                return true;
+        }
+        return false;
+}
+
+bool parse_metering_mode(std::string_view val, libcamera_options *opts)
+{
+        if (val.size() == strlen("centre") &&
+                        strncasecmp(val.data(), "centre", val.size()) == 0) {
+                opts->metering_set = true;
+                opts->metering_mode =
+                        libcamera::controls::MeteringCentreWeighted;
+                opts->metering_name = "centre";
+                return true;
+        }
+        if (val.size() == strlen("spot") &&
+                        strncasecmp(val.data(), "spot", val.size()) == 0) {
+                opts->metering_set = true;
+                opts->metering_mode = libcamera::controls::MeteringSpot;
+                opts->metering_name = "spot";
+                return true;
+        }
+        if (val.size() == strlen("matrix") &&
+                        strncasecmp(val.data(), "matrix", val.size()) == 0) {
+                opts->metering_set = true;
+                opts->metering_mode = libcamera::controls::MeteringMatrix;
+                opts->metering_name = "matrix";
+                return true;
+        }
+        return false;
+}
+
+bool parse_focus_m(std::string_view val, libcamera_options *opts)
+{
+        if (val == "inf") {
+                opts->focus_m_set = true;
+                opts->focus_m_inf = true;
+                opts->focus_m = std::numeric_limits<double>::infinity();
+                return true;
+        }
+
+        std::string focus_m_str(val);
+        char *end = nullptr;
+        errno = 0;
+        const double parsed_focus_m = strtod(focus_m_str.c_str(), &end);
+        if (errno != 0 || end == focus_m_str.c_str() || *end != '\0' ||
+                        !std::isfinite(parsed_focus_m) ||
+                        parsed_focus_m <= 0.0) {
+                return false;
+        }
+
+        opts->focus_m_set = true;
+        opts->focus_m_inf = false;
+        opts->focus_m = parsed_focus_m;
+        return true;
+}
+
+bool parse_ae_diag_interval(std::string_view val, libcamera_options *opts)
+{
+        opts->ae_diag_set = true;
+        if (val.empty()) {
+                opts->ae_diag_interval = 30;
+                return true;
+        }
+
+        std::string interval_str(val);
+        char *end = nullptr;
+        errno = 0;
+        const unsigned long interval =
+                strtoul(interval_str.c_str(), &end, 10);
+        if (errno != 0 || end == interval_str.c_str() || *end != '\0' ||
+                        interval == 0 ||
+                        interval > std::numeric_limits<unsigned int>::max()) {
+                return false;
+        }
+
+        opts->ae_diag_interval = static_cast<unsigned int>(interval);
+        return true;
+}
+
+bool parse_float_option(std::string_view val, const char *name, float *target,
+                bool *set)
+{
+        std::string value_str(val);
+        char *end = nullptr;
+        errno = 0;
+        const float value = strtof(value_str.c_str(), &end);
+        if (errno != 0 || end == value_str.c_str() || *end != '\0' ||
+                        !std::isfinite(value)) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "invalid %s value: expected finite "
+                                "float\n",
+                                name);
+                return false;
+        }
+        *target = value;
+        *set = true;
+        return true;
+}
+
+void set_af_range_control(libcamera::ControlList *controls,
+                libcamera_options::AfRange range)
+{
+        switch (range) {
+        case libcamera_options::AfRange::Normal:
+                controls->set(libcamera::controls::AfRange,
+                                libcamera::controls::AfRangeNormal);
+                break;
+        case libcamera_options::AfRange::Macro:
+                controls->set(libcamera::controls::AfRange,
+                                libcamera::controls::AfRangeMacro);
+                break;
+        case libcamera_options::AfRange::Full:
+                controls->set(libcamera::controls::AfRange,
+                                libcamera::controls::AfRangeFull);
+                break;
+        }
+}
+
+libcamera::Rectangle map_af_area_to_scaler_crop(
+                const af_area_preset &preset,
+                const libcamera::Rectangle &scaler_crop)
+{
+        const int min_x = scaler_crop.x;
+        const int min_y = scaler_crop.y;
+        const int max_x = scaler_crop.x + static_cast<int>(scaler_crop.width);
+        const int max_y = scaler_crop.y + static_cast<int>(scaler_crop.height);
+        int x = scaler_crop.x +
+                static_cast<int>(std::llround(preset.x * scaler_crop.width));
+        int y = scaler_crop.y +
+                static_cast<int>(std::llround(preset.y * scaler_crop.height));
+        unsigned int width = static_cast<unsigned int>(
+                        std::max<int64_t>(1,
+                                std::llround(preset.width *
+                                        scaler_crop.width)));
+        unsigned int height = static_cast<unsigned int>(
+                        std::max<int64_t>(1,
+                                std::llround(preset.height *
+                                        scaler_crop.height)));
+        x = std::clamp(x, min_x, max_x - 1);
+        y = std::clamp(y, min_y, max_y - 1);
+        width = std::min<unsigned int>(width,
+                        static_cast<unsigned int>(max_x - x));
+        height = std::min<unsigned int>(height,
+                        static_cast<unsigned int>(max_y - y));
+
+        return { x, y, width, height };
+}
+
+bool apply_focus_controls(vidcap_libcamera_state *s,
+                const libcamera_options &opts,
+                libcamera::ControlList *controls,
+                bool log_requested)
+{
+        if (!opts.focus_set) {
+                return true;
+        }
+
+        if (opts.focus_manual) {
+                if (s->camera->controls().count(
+                                libcamera::controls::AfMode.id()) == 0 ||
+                                s->camera->controls().count(
+                                        libcamera::controls::LensPosition.id()) == 0) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "manual focus requested but "
+                                        "this camera does not expose AfMode/"
+                                        "LensPosition controls\n");
+                        return false;
+                }
+                const float lens_position = opts.focus_m_inf ? 0.0f :
+                        static_cast<float>(1.0 / opts.focus_m);
+                controls->set(libcamera::controls::AfMode,
+                                libcamera::controls::AfModeManual);
+                controls->set(libcamera::controls::LensPosition,
+                                lens_position);
+                if (!log_requested) {
+                        return true;
+                } else if (opts.focus_m_inf) {
+                        log_msg(LOG_LEVEL_INFO,
+                                        MOD_NAME "focus requested: mode=manual "
+                                        "distance=inf lens_position=%.3fD\n",
+                                        lens_position);
+                } else {
+                        log_msg(LOG_LEVEL_INFO,
+                                        MOD_NAME "focus requested: mode=manual "
+                                        "distance=%.3fm lens_position=%.3fD\n",
+                                        opts.focus_m, lens_position);
+                }
+                return true;
+        }
+
+        if (s->camera->controls().count(libcamera::controls::AfMode.id()) == 0) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "focus=afc requested but AfMode "
+                                "control is not available\n");
+                return false;
+        }
+        controls->set(libcamera::controls::AfMode,
+                        libcamera::controls::AfModeContinuous);
+
+        if (opts.af_range_set) {
+                if (s->camera->controls().count(
+                                libcamera::controls::AfRange.id()) == 0) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "af_range requested but "
+                                        "AfRange control is not available\n");
+                        return false;
+                }
+                set_af_range_control(controls, opts.af_range);
+        }
+
+        if (opts.af_speed_set) {
+                if (s->camera->controls().count(
+                                libcamera::controls::AfSpeed.id()) == 0) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "af_speed requested but "
+                                        "AfSpeed control is not available\n");
+                        return false;
+                }
+                controls->set(libcamera::controls::AfSpeed,
+                                opts.af_speed ==
+                                        libcamera_options::AfSpeed::Fast ?
+                                        libcamera::controls::AfSpeedFast :
+                                        libcamera::controls::AfSpeedNormal);
+        }
+
+        if (!opts.af_area_set) {
+                if (log_requested) {
+                        log_msg(LOG_LEVEL_INFO,
+                                        MOD_NAME "focus requested: mode=continuous "
+                                        "speed=%s range=%s area=default\n",
+                                        opts.af_speed_set ?
+                                                af_speed_to_string(opts.af_speed) :
+                                                "default",
+                                        opts.af_range_set ?
+                                                af_range_to_string(opts.af_range) :
+                                                "default");
+                }
+                return true;
+        }
+
+        if (s->camera->controls().count(
+                        libcamera::controls::AfMetering.id()) == 0 ||
+                        s->camera->controls().count(
+                                libcamera::controls::AfWindows.id()) == 0) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "af_area requested but AfMetering/"
+                                "AfWindows controls are not available\n");
+                return false;
+        }
+
+        const af_area_preset *preset =
+                find_af_area_preset(opts.af_area_name);
+        if (preset == nullptr) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "invalid af_area value: expected "
+                                "full, mid, or center\n");
+                return false;
+        }
+
+        const std::optional<libcamera::Rectangle> scaler_crop =
+                s->camera->properties().get(
+                                libcamera::properties::ScalerCropMaximum);
+        if (!scaler_crop || scaler_crop->isNull()) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "af_area requested but "
+                                "ScalerCropMaximum is not available; cannot "
+                                "map autofocus window safely\n");
+                return false;
+        }
+
+        const libcamera::Rectangle pixel_area =
+                map_af_area_to_scaler_crop(*preset, *scaler_crop);
+        controls->set(libcamera::controls::AfMetering,
+                        libcamera::controls::AfMeteringWindows);
+        controls->set(libcamera::controls::AfWindows, { pixel_area });
+
+        if (log_requested) {
+                log_msg(LOG_LEVEL_INFO,
+                                MOD_NAME "focus requested: mode=continuous "
+                                "speed=%s range=%s area=%s "
+                                "norm=%.4g,%.4g,%.4g,%.4g pixel_area=%s\n",
+                                opts.af_speed_set ?
+                                        af_speed_to_string(opts.af_speed) :
+                                        "default",
+                                opts.af_range_set ?
+                                        af_range_to_string(opts.af_range) :
+                                        "default",
+                                preset->name, preset->x, preset->y,
+                                preset->width, preset->height,
+                                pixel_area.toString().c_str());
+        }
+        return true;
+}
+
+bool get_float_control_range(vidcap_libcamera_state *s,
+                const libcamera::Control<float> &control,
+                float *min,
+                float *max,
+                float *def)
+{
+        const auto info = s->camera->controls().find(control.id());
+        if (info == s->camera->controls().end()) {
+                return false;
+        }
+
+        if (!info->second.min().isNone()) {
+                *min = info->second.min().get<float>();
+        } else {
+                *min = -std::numeric_limits<float>::infinity();
+        }
+        if (!info->second.max().isNone()) {
+                *max = info->second.max().get<float>();
+        } else {
+                *max = std::numeric_limits<float>::infinity();
+        }
+        if (!info->second.def().isNone()) {
+                *def = info->second.def().get<float>();
+        } else {
+                *def = std::numeric_limits<float>::quiet_NaN();
+        }
+        return true;
+}
+
+bool set_float_control_checked(vidcap_libcamera_state *s,
+                libcamera::ControlList *controls,
+                const libcamera::Control<float> &control,
+                const char *public_name,
+                const char *control_name,
+                float value,
+                bool explicit_request,
+                const char *source)
+{
+        float min = 0.0f;
+        float max = 0.0f;
+        float def = 0.0f;
+        if (!get_float_control_range(s, control, &min, &max, &def)) {
+                if (explicit_request) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "%s requested but %s control "
+                                        "is not available\n",
+                                        public_name, control_name);
+                        return false;
+                }
+                log_msg(LOG_LEVEL_WARNING,
+                                MOD_NAME "%s preset wants %s=%.3f but %s "
+                                "control is not available; skipping\n",
+                                source, public_name, value, control_name);
+                return true;
+        }
+
+        if (value < min || value > max) {
+                if (explicit_request) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "%s=%.3f outside supported "
+                                        "range %.3f..%.3f\n",
+                                        public_name, value, min, max);
+                        return false;
+                }
+                log_msg(LOG_LEVEL_WARNING,
+                                MOD_NAME "%s preset wants %s=%.3f outside "
+                                "supported range %.3f..%.3f; skipping\n",
+                                source, public_name, value, min, max);
+                return true;
+        }
+
+        controls->set(control, value);
+        log_msg(LOG_LEVEL_INFO,
+                        MOD_NAME "%s requested: %.3f applied: %.3f "
+                        "source=%s range=%.3f..%.3f\n",
+                        public_name, value, value,
+                        explicit_request ? "user" : source, min, max);
+        return true;
+}
+
+bool set_ir_contrast_preset(vidcap_libcamera_state *s,
+                libcamera::ControlList *controls)
+{
+        float min = 0.0f;
+        float max = 0.0f;
+        float def = 0.0f;
+        if (!get_float_control_range(s, libcamera::controls::Contrast,
+                        &min, &max, &def)) {
+                log_msg(LOG_LEVEL_WARNING,
+                                MOD_NAME "night=ir preset wants contrast=1.200 "
+                                "but Contrast control is not available; "
+                                "skipping\n");
+                return true;
+        }
+
+        float contrast = 1.2f;
+        const char *source = "night=ir";
+        if (contrast < min || contrast > max) {
+                if (std::isfinite(def) && def >= min && def <= max) {
+                        log_msg(LOG_LEVEL_WARNING,
+                                        MOD_NAME "night=ir preset contrast=1.200 "
+                                        "outside supported range %.3f..%.3f; "
+                                        "using control default %.3f\n",
+                                        min, max, def);
+                        contrast = def;
+                        source = "night=ir-default";
+                } else {
+                        log_msg(LOG_LEVEL_WARNING,
+                                        MOD_NAME "night=ir preset contrast=1.200 "
+                                        "outside supported range %.3f..%.3f "
+                                        "and no usable default is available; "
+                                        "skipping\n",
+                                        min, max);
+                        return true;
+                }
+        }
+
+        controls->set(libcamera::controls::Contrast, contrast);
+        log_msg(LOG_LEVEL_INFO,
+                        MOD_NAME "contrast requested: %.3f applied: %.3f "
+                        "source=%s range=%.3f..%.3f\n",
+                        contrast, contrast, source, min, max);
+        return true;
+}
+
+bool apply_exposure_controls(vidcap_libcamera_state *s,
+                const libcamera_options &opts,
+                libcamera::ControlList *controls)
+{
+        bool ae_enable_requested = opts.ae_set;
+        bool ae_enable = opts.ae_enable;
+
+        if (opts.night_set &&
+                        (opts.night_mode ==
+                                libcamera_options::NightMode::Ir ||
+                         opts.night_mode ==
+                                libcamera_options::NightMode::Lowlight) &&
+                        !opts.ae_set) {
+                ae_enable_requested = true;
+                ae_enable = true;
+        }
+
+        if (ae_enable_requested) {
+                if (s->camera->controls().count(
+                                libcamera::controls::AeEnable.id()) == 0) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "ae requested but AeEnable "
+                                        "control is not available\n");
+                        return false;
+                }
+                controls->set(libcamera::controls::AeEnable, ae_enable);
+                log_msg(LOG_LEVEL_INFO,
+                                MOD_NAME "AE requested: %s applied: %s\n",
+                                ae_enable ? "on" : "off",
+                                ae_enable ? "on" : "off");
+        }
+
+        if (opts.metering_set) {
+                if (s->camera->controls().count(
+                                libcamera::controls::AeMeteringMode.id()) ==
+                                0) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "metering requested but "
+                                        "AeMeteringMode control is not "
+                                        "available\n");
+                        return false;
+                }
+                controls->set(libcamera::controls::AeMeteringMode,
+                                opts.metering_mode);
+                log_msg(LOG_LEVEL_INFO,
+                                MOD_NAME "metering requested: %s applied: %s\n",
+                                opts.metering_name.c_str(),
+                                metering_mode_to_string(opts.metering_mode));
+        }
+
+        if (opts.night_set) {
+                if (s->camera->controls().count(
+                                libcamera::controls::AeExposureMode.id()) ==
+                                0) {
+                        log_msg(LOG_LEVEL_ERROR,
+                                        MOD_NAME "night requested but "
+                                        "AeExposureMode control is not "
+                                        "available\n");
+                        return false;
+                }
+
+                int32_t exposure_mode = libcamera::controls::ExposureNormal;
+                if (opts.night_mode == libcamera_options::NightMode::Ir ||
+                                opts.night_mode ==
+                                        libcamera_options::NightMode::Lowlight) {
+                        exposure_mode = libcamera::controls::ExposureLong;
+                }
+
+                controls->set(libcamera::controls::AeExposureMode,
+                                exposure_mode);
+                log_msg(LOG_LEVEL_INFO,
+                                MOD_NAME "night requested: %s applied: %s "
+                                "exposure=%s\n",
+                                opts.night_name.c_str(),
+                                night_mode_to_string(opts.night_mode),
+                                exposure_mode ==
+                                        libcamera::controls::ExposureLong ?
+                                        "long" : "normal");
+                if (opts.night_mode == libcamera_options::NightMode::Ir) {
+                        log_msg(LOG_LEVEL_INFO,
+                                        MOD_NAME "night=ir is an image preset "
+                                        "for NoIR/IR illumination; it does "
+                                        "not switch an IR-cut filter\n");
+                }
+        }
+
+        if (opts.night_set &&
+                        opts.night_mode ==
+                                libcamera_options::NightMode::Lowlight &&
+                        !opts.ev_set) {
+                log_msg(LOG_LEVEL_INFO,
+                                MOD_NAME "night=lowlight preset controls: "
+                                "preset ev=1.000\n");
+                if (!set_float_control_checked(s, controls,
+                                libcamera::controls::ExposureValue,
+                                "ev", "ExposureValue", 1.0f, false,
+                                "night=lowlight")) {
+                        return false;
+                }
+        }
+
+        if (opts.night_set &&
+                        opts.night_mode == libcamera_options::NightMode::Ir) {
+                log_msg(LOG_LEVEL_INFO,
+                                MOD_NAME "night=ir preset controls: preset "
+                                "ev=%.1f saturation=%.1f contrast=%.1f\n",
+                                opts.ev_set ? opts.ev : 0.7f,
+                                opts.saturation_set ? opts.saturation : 0.0f,
+                                opts.contrast_set ? opts.contrast : 1.2f);
+                if (!opts.ev_set &&
+                                !set_float_control_checked(s, controls,
+                                        libcamera::controls::ExposureValue,
+                                        "ev", "ExposureValue", 0.7f, false,
+                                        "night=ir")) {
+                        return false;
+                }
+                if (!opts.saturation_set &&
+                                !set_float_control_checked(s, controls,
+                                        libcamera::controls::Saturation,
+                                        "saturation", "Saturation", 0.0f,
+                                        false, "night=ir")) {
+                        return false;
+                }
+                if (!opts.contrast_set &&
+                                !set_ir_contrast_preset(s, controls)) {
+                        return false;
+                }
+        }
+
+        if (opts.ev_set &&
+                        !set_float_control_checked(s, controls,
+                                libcamera::controls::ExposureValue,
+                                "ev", "ExposureValue", opts.ev, true,
+                                "user")) {
+                return false;
+        }
+        if (opts.brightness_set &&
+                        !set_float_control_checked(s, controls,
+                                libcamera::controls::Brightness,
+                                "brightness", "Brightness", opts.brightness,
+                                true, "user")) {
+                return false;
+        }
+        if (opts.saturation_set &&
+                        !set_float_control_checked(s, controls,
+                                libcamera::controls::Saturation,
+                                "saturation", "Saturation", opts.saturation,
+                                true, "user")) {
+                return false;
+        }
+        if (opts.contrast_set &&
+                        !set_float_control_checked(s, controls,
+                                libcamera::controls::Contrast,
+                                "contrast", "Contrast", opts.contrast, true,
+                                "user")) {
+                return false;
+        }
+
+        return true;
+}
+
 bool start_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
 {
         libcamera::ControlList controls(s->camera->controls());
@@ -826,6 +1618,22 @@ bool start_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
                 }
         }
 
+        if (opts.ae_set || opts.metering_set || opts.night_set ||
+                        opts.ev_set || opts.brightness_set ||
+                        opts.saturation_set || opts.contrast_set) {
+                if (!apply_exposure_controls(s, opts, &controls)) {
+                        return false;
+                }
+                start_controls = &controls;
+        }
+
+        if (opts.focus_set) {
+                if (!apply_focus_controls(s, opts, &controls, true)) {
+                        return false;
+                }
+                start_controls = &controls;
+        }
+
         s->camera->requestCompleted.connect(s,
                         &vidcap_libcamera_state::request_completed);
         s->callback_connected = true;
@@ -839,6 +1647,11 @@ bool start_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
         s->camera_started = true;
 
         for (const std::unique_ptr<libcamera::Request> &request : s->requests) {
+                if (opts.focus_set &&
+                                !apply_focus_controls(s, opts,
+                                        &request->controls(), false)) {
+                        return false;
+                }
                 int queue_ret = s->camera->queueRequest(request.get());
                 if (queue_ret != 0) {
                         log_msg(LOG_LEVEL_ERROR,
@@ -849,6 +1662,238 @@ bool start_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
         }
 
         return true;
+}
+
+bool request_focus_controls(vidcap_libcamera_state *s,
+                const libcamera_options &opts,
+                libcamera::Request *request)
+{
+        if (!opts.focus_set) {
+                return true;
+        }
+        return apply_focus_controls(s, opts, &request->controls(), false);
+}
+
+void log_focus_metadata_if_needed(vidcap_libcamera_state *s,
+                const libcamera::Request *request)
+{
+        const libcamera::ControlList &metadata = request->metadata();
+        const std::optional<int32_t> af_mode =
+                metadata.get(libcamera::controls::AfMode);
+        const std::optional<float> lens_position =
+                metadata.get(libcamera::controls::LensPosition);
+        const std::optional<int32_t> af_state =
+                metadata.get(libcamera::controls::AfState);
+        const std::optional<int32_t> focus_fom =
+                metadata.get(libcamera::controls::FocusFoM);
+
+        if (!af_mode && !lens_position && !af_state && !focus_fom) {
+                return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        const bool key_state_changed =
+                af_mode != s->last_metadata_af_mode ||
+                lens_position != s->last_metadata_lens_position ||
+                af_state != s->last_metadata_af_state;
+        const bool elapsed =
+                s->last_focus_metadata_log.time_since_epoch().count() == 0 ||
+                now - s->last_focus_metadata_log >= std::chrono::seconds(1);
+        if (!key_state_changed && !elapsed) {
+                return;
+        }
+
+        char mode_buf[32] = "n/a";
+        char lens_buf[32] = "n/a";
+        char state_buf[32] = "n/a";
+        char fom_buf[32] = "n/a";
+        if (af_mode) {
+                snprintf(mode_buf, sizeof mode_buf, "%s",
+                                af_mode_to_string(*af_mode));
+        }
+        if (lens_position) {
+                snprintf(lens_buf, sizeof lens_buf, "%.3fD", *lens_position);
+        }
+        if (af_state) {
+                snprintf(state_buf, sizeof state_buf, "%s",
+                                af_state_to_string(*af_state));
+        }
+        if (focus_fom) {
+                snprintf(fom_buf, sizeof fom_buf, "%" PRId32, *focus_fom);
+        }
+
+        log_msg(LOG_LEVEL_INFO,
+                        MOD_NAME "focus metadata: mode=%s "
+                        "lens_position=%s af_state=%s focus_fom=%s\n",
+                        mode_buf, lens_buf, state_buf, fom_buf);
+
+        s->last_focus_metadata_log = now;
+        s->last_metadata_af_mode = af_mode;
+        s->last_metadata_lens_position = lens_position;
+        s->last_metadata_af_state = af_state;
+        s->last_metadata_focus_fom = focus_fom;
+}
+
+std::string format_int32_metadata(const std::optional<int32_t> &value)
+{
+        if (!value) {
+                return "n/a";
+        }
+        char buf[32];
+        snprintf(buf, sizeof buf, "%" PRId32, *value);
+        return buf;
+}
+
+std::string format_int64_metadata(const std::optional<int64_t> &value)
+{
+        if (!value) {
+                return "n/a";
+        }
+        char buf[32];
+        snprintf(buf, sizeof buf, "%" PRId64, *value);
+        return buf;
+}
+
+std::string format_float_metadata(const std::optional<float> &value,
+                const char *fmt)
+{
+        if (!value) {
+                return "n/a";
+        }
+        char buf[32];
+        snprintf(buf, sizeof buf, fmt, *value);
+        return buf;
+}
+
+std::string format_ae_state_metadata(const std::optional<int32_t> &value)
+{
+        if (!value) {
+                return "n/a";
+        }
+        char buf[64];
+        snprintf(buf, sizeof buf, "%" PRId32 "(%s)", *value,
+                        ae_state_to_string(*value));
+        return buf;
+}
+
+std::string format_af_state_metadata(const std::optional<int32_t> &value)
+{
+        if (!value) {
+                return "n/a";
+        }
+        char buf[64];
+        snprintf(buf, sizeof buf, "%" PRId32 "(%s)", *value,
+                        af_state_to_string(*value));
+        return buf;
+}
+
+std::string requested_focus_mode(const libcamera_options &opts)
+{
+        if (opts.focus_manual) {
+                return "manual";
+        }
+        if (opts.focus_afc) {
+                return "afc";
+        }
+        return "unset";
+}
+
+std::string requested_focus_m(const libcamera_options &opts)
+{
+        if (!opts.focus_manual || !opts.focus_m_set) {
+                return "n/a";
+        }
+        if (opts.focus_m_inf) {
+                return "inf";
+        }
+        char buf[32];
+        snprintf(buf, sizeof buf, "%.6g", opts.focus_m);
+        return buf;
+}
+
+void log_ae_diag_if_needed(vidcap_libcamera_state *s,
+                const libcamera::Request *request,
+                uint64_t sequence)
+{
+        const libcamera_options &opts = s->opts;
+        if (!opts.ae_diag_set) {
+                return;
+        }
+
+        const libcamera::ControlList &metadata = request->metadata();
+        const std::optional<int32_t> exposure_time =
+                metadata.get(libcamera::controls::ExposureTime);
+        const std::optional<float> analogue_gain =
+                metadata.get(libcamera::controls::AnalogueGain);
+        const std::optional<float> digital_gain =
+                metadata.get(libcamera::controls::DigitalGain);
+        const std::optional<float> lux =
+                metadata.get(libcamera::controls::Lux);
+        const std::optional<int32_t> ae_state =
+                metadata.get(libcamera::controls::AeState);
+        const std::optional<int64_t> frame_duration =
+                metadata.get(libcamera::controls::FrameDuration);
+        const std::optional<float> lens_position =
+                metadata.get(libcamera::controls::LensPosition);
+        const std::optional<int32_t> af_state =
+                metadata.get(libcamera::controls::AfState);
+        const std::optional<int32_t> focus_fom =
+                metadata.get(libcamera::controls::FocusFoM);
+
+        if (exposure_time && analogue_gain && digital_gain &&
+                        frame_duration &&
+                        *exposure_time >= 0.95 * *frame_duration &&
+                        *analogue_gain >= 15.5f &&
+                        *digital_gain <= 1.05f) {
+                const auto now = std::chrono::steady_clock::now();
+                if (s->last_ae_ceiling_log.time_since_epoch().count() == 0 ||
+                                now - s->last_ae_ceiling_log >=
+                                        std::chrono::seconds(5)) {
+                        log_msg(LOG_LEVEL_WARNING,
+                                        "[libcamera ae_diag] exposure/gain "
+                                        "ceiling reached: exposure_us=%" PRId32
+                                        " frame_duration_us=%" PRId64
+                                        " analogue_gain=%.3f "
+                                        "digital_gain=%.3f; night preset "
+                                        "cannot increase sensor exposure at "
+                                        "current fps\n",
+                                        *exposure_time, *frame_duration,
+                                        *analogue_gain, *digital_gain);
+                        s->last_ae_ceiling_log = now;
+                }
+        }
+
+        const unsigned int frame_index = ++s->ae_diag_completed_frames;
+        if (frame_index > 10 &&
+                        frame_index % opts.ae_diag_interval != 0) {
+                return;
+        }
+
+        const char *night = opts.night_set ? opts.night_name.c_str() : "unset";
+        const char *ae = opts.ae_set ? (opts.ae_enable ? "on" : "off") :
+                "unset";
+        const char *metering = opts.metering_set ?
+                opts.metering_name.c_str() : "unset";
+        const std::string focus = requested_focus_mode(opts);
+        const std::string focus_m = requested_focus_m(opts);
+
+        log_msg(LOG_LEVEL_INFO,
+                        "[libcamera ae_diag] seq=%" PRIu64
+                        " night=%s ae=%s metering=%s focus=%s focus_m=%s "
+                        "exposure_us=%s analogue_gain=%s digital_gain=%s "
+                        "lux=%s ae_state=%s frame_duration_us=%s "
+                        "lens_position=%s af_state=%s focus_fom=%s\n",
+                        sequence, night, ae, metering, focus.c_str(),
+                        focus_m.c_str(),
+                        format_int32_metadata(exposure_time).c_str(),
+                        format_float_metadata(analogue_gain, "%.3f").c_str(),
+                        format_float_metadata(digital_gain, "%.3f").c_str(),
+                        format_float_metadata(lux, "%.3f").c_str(),
+                        format_ae_state_metadata(ae_state).c_str(),
+                        format_int64_metadata(frame_duration).c_str(),
+                        format_float_metadata(lens_position, "%.3f").c_str(),
+                        format_af_state_metadata(af_state).c_str(),
+                        format_int32_metadata(focus_fom).c_str());
 }
 
 void vidcap_libcamera_probe(struct device_info **available_cards, int *count,
@@ -894,7 +1939,7 @@ void print_usage()
 {
                 printf("libcamera capture\n");
                 printf("Usage:\n");
-                printf("\t-t libcamera[:d=<index>|camera=<index>][:hdr|hdr=on|hdr=off][:sensor=WxH][:size=WxH][:fps=N][:format=YUV420|I420|UYVY|YUYV][:list|caps|test|help|fullhelp]\n");
+                printf("\t-t libcamera[:d=<index>|camera=<index>][:hdr|hdr=on|hdr=off][:night=off|ir|lowlight][:metering=centre|spot|matrix][:ae=on|off][:ev=<float>][:brightness=<float>][:saturation=<float>][:contrast=<float>][:ae_diag[=N]][:sensor=WxH][:size=WxH][:fps=N][:format=YUV420|I420|UYVY|YUYV][:focus=manual:focus_m=<metres|inf>|focus=afc[:af_speed=normal|fast][:af_range=normal|macro|full][:af_area=full|mid|center]][:list|caps|test|help|fullhelp]\n");
         printf("\n");
 }
 
@@ -910,6 +1955,25 @@ void show_fullhelp()
         printf("hdr or hdr=on enables experimental IMX708 sensor HDR.\n");
         printf("hdr=off explicitly disables IMX708 WDR/HDR. Without hdr, WDR/HDR state is not touched.\n");
         printf("IMX708 HDR uses internal sensor mode 2304x1296 and max_fps=30.\n");
+        printf("night=off|ir|lowlight selects AE/image presets only; it does not touch HDR/WDR state.\n");
+        printf("night=lowlight applies ev=1.0 by default unless ev= is explicitly provided.\n");
+        printf("night=ir applies ev=0.7, saturation=0.0 and, when supported, contrast=1.2 by default unless explicitly overridden.\n");
+        printf("night=ir is an image preset for NoIR/IR illumination and does not switch a hardware IR-cut filter.\n");
+        printf("metering=centre|spot|matrix selects AeMeteringMode.\n");
+        printf("ae=on|off enables or disables automatic exposure.\n");
+        printf("ev=<float> sets ExposureValue when supported.\n");
+        printf("brightness=<float> sets Brightness when supported.\n");
+        printf("saturation=<float> sets Saturation when supported.\n");
+        printf("contrast=<float> sets Contrast when supported.\n");
+        printf("ae_diag[=N] logs AE/AF metadata every N frames, plus first 10 frames; default N is 30.\n");
+        printf("focus=manual:focus_m=<metres|inf> enables manual focus; focus_m=inf maps to infinity focus.\n");
+        printf("focus=afc enables continuous autofocus.\n");
+        printf("af_speed=normal or af_speed=fast selects autofocus speed when focus=afc is used.\n");
+        printf("af_range=normal, af_range=macro or af_range=full selects autofocus range when focus=afc is used.\n");
+        printf("af_area=full uses the whole image for autofocus metering when focus=afc is used.\n");
+        printf("af_area=mid uses the central half of the image width and height.\n");
+        printf("af_area=center uses the central third of the image width and height.\n");
+        printf("Numeric autofocus windows are intentionally not part of the public API yet.\n");
         printf("format=YUV420 selects planar 4:2:0 and maps to UltraGrid I420. I420 is an alias.\n");
         printf("format=UYVY and format=YUYV select packed 8-bit 4:2:2 handoff if libcamera can negotiate them natively.\n");
         printf("format=YUV422 is recognized but rejected because this UltraGrid tree has no direct matching internal planar 8-bit 4:2:2 codec mapping.\n");
@@ -929,6 +1993,14 @@ void show_fullhelp()
                 printf("\tFull-FOV-ish 720p56: -t libcamera:d=0:sensor=2304x1296:size=1280x720:fps=56:format=YUV420\n");
                 printf("\tCropped 720p60+:     -t libcamera:d=0:sensor=1536x864:size=1280x720:fps=60:format=YUV420\n");
                 printf("\tIMX708 HDR 720p30:   -t libcamera:d=0:hdr:size=1280x720:fps=30:format=YUV420\n");
+                printf("\tLow light preset:    -t libcamera:d=0:night=lowlight:size=1280x720:fps=30:format=YUV420\n");
+                printf("\tIR exposure preset:  -t libcamera:d=0:night=ir:metering=centre:size=1280x720:fps=30:format=YUV420\n");
+                printf("\tAE off:              -t libcamera:d=0:ae=off:size=1280x720:fps=30:format=YUV420\n");
+                printf("\tAE diagnostics:      -t libcamera:d=0:size=1280x720:fps=30:format=YUV420:night=lowlight:metering=spot:ae_diag=30\n");
+                printf("\tManual image ctrl:   -t libcamera:d=0:night=off:ev=1.0:brightness=0.1:contrast=1.2:saturation=0.5:size=1280x720:fps=30:format=YUV420\n");
+                printf("\tManual focus 2 m:    -t libcamera:d=0:focus=manual:focus_m=2.0:size=1280x720:fps=30:format=YUV420\n");
+                printf("\tManual focus inf:    -t libcamera:d=0:focus=manual:focus_m=inf:size=1280x720:fps=30:format=YUV420\n");
+                printf("\tContinuous AF:       -t libcamera:d=0:focus=afc:af_speed=fast:af_range=full:af_area=mid:size=1280x720:fps=30:format=YUV420\n");
         printf("Status: progressive YUV capture handoff is implemented.\n");
 }
 
@@ -939,6 +2011,13 @@ void show_help_header()
         printf("\t-t libcamera\n");
                 printf("\t-t libcamera:d=0:size=1280x720:fps=50:format=YUV420\n");
                 printf("\t-t libcamera:d=0:hdr:size=1280x720:fps=30:format=YUV420\n");
+                printf("\t-t libcamera:d=0:night=lowlight:size=1280x720:fps=30:format=YUV420\n");
+                printf("\t-t libcamera:d=0:night=ir:metering=centre:size=1280x720:fps=30:format=YUV420\n");
+                printf("\t-t libcamera:d=0:ae=off:size=1280x720:fps=30:format=YUV420\n");
+                printf("\t-t libcamera:d=0:size=1280x720:fps=30:format=YUV420:night=lowlight:metering=spot:ae_diag=30\n");
+                printf("\t-t libcamera:d=0:night=off:ev=1.0:brightness=0.1:contrast=1.2:saturation=0.5:size=1280x720:fps=30:format=YUV420\n");
+                printf("\t-t libcamera:d=0:focus=manual:focus_m=2.0:size=1280x720:fps=30:format=YUV420\n");
+                printf("\t-t libcamera:d=0:focus=afc:af_speed=fast:af_range=full:af_area=mid:size=1280x720:fps=30:format=YUV420\n");
         printf("\t-t libcamera:d=0:sensor=2304x1296:size=1280x720:fps=56:format=YUV420\n");
         printf("\t-t libcamera:d=0:sensor=1536x864:size=1280x720:fps=60:format=YUV420\n");
         printf("\t-t libcamera:d=0:size=1280x720:fps=50:format=UYVY\n");
@@ -949,6 +2028,9 @@ void show_help_header()
         printf("Default uses libcamera's VideoRecording configuration.\n");
         printf("Supported output formats: YUV420/I420; UYVY/YUYV if negotiated natively.\n");
         printf("Note: size=1280x720 may select a cropped sensor mode unless sensor= is explicitly used.\n");
+        printf("night=ir is an image preset for NoIR/IR illumination; it does not switch hardware IR-cut.\n");
+        printf("ev=, brightness=, saturation= and contrast= apply libcamera image controls when supported.\n");
+        printf("ae_diag[=N] logs AE/AF metadata every N frames, plus first 10 frames.\n");
         printf("YUV422/YUV444 are recognized but rejected: no direct internal planar 8-bit codec mapping in this UltraGrid tree.\n");
         printf("test: measured FPS support test.\n");
         printf("Use -t libcamera:fullhelp for parameter details and -t libcamera:caps for full capabilities.\n");
@@ -1066,6 +2148,135 @@ int parse_fmt(std::string_view fmt, libcamera_options *opts)
                                 return VIDCAP_INIT_FAIL;
                         }
                         opts->fps_set = true;
+                } else if (key == "focus") {
+                        opts->focus_set = true;
+                        if (val.size() == strlen("afc") &&
+                                        strncasecmp(val.data(), "afc",
+                                                val.size()) == 0) {
+                                opts->focus_afc = true;
+                        } else if (val.size() == strlen("manual") &&
+                                        strncasecmp(val.data(), "manual",
+                                                val.size()) == 0) {
+                                opts->focus_manual = true;
+                        }
+                } else if (key == "focus_m") {
+                        if (!parse_focus_m(val, opts)) {
+                                log_msg(LOG_LEVEL_ERROR,
+                                                MOD_NAME "invalid focus_m "
+                                                "value: expected positive "
+                                                "finite metres or inf\n");
+                                return VIDCAP_INIT_FAIL;
+                        }
+                } else if (key == "af_speed") {
+                        if (val.size() == strlen("normal") &&
+                                        strncasecmp(val.data(), "normal",
+                                        val.size()) == 0) {
+                                opts->af_speed_set = true;
+                                opts->af_speed = libcamera_options::AfSpeed::Normal;
+                        } else if (val.size() == strlen("fast") &&
+                                        strncasecmp(val.data(), "fast",
+                                                val.size()) == 0) {
+                                opts->af_speed_set = true;
+                                opts->af_speed = libcamera_options::AfSpeed::Fast;
+                        } else {
+                                log_msg(LOG_LEVEL_ERROR,
+                                                MOD_NAME "invalid af_speed "
+                                                "value: expected normal or "
+                                                "fast\n");
+                                return VIDCAP_INIT_FAIL;
+                        }
+                } else if (key == "af_range") {
+                        if (val.size() == strlen("normal") &&
+                                        strncasecmp(val.data(), "normal",
+                                        val.size()) == 0) {
+                                opts->af_range_set = true;
+                                opts->af_range = libcamera_options::AfRange::Normal;
+                        } else if (val.size() == strlen("macro") &&
+                                        strncasecmp(val.data(), "macro",
+                                                val.size()) == 0) {
+                                opts->af_range_set = true;
+                                opts->af_range = libcamera_options::AfRange::Macro;
+                        } else if (val.size() == strlen("full") &&
+                                        strncasecmp(val.data(), "full",
+                                                val.size()) == 0) {
+                                opts->af_range_set = true;
+                                opts->af_range = libcamera_options::AfRange::Full;
+                        } else {
+                                log_msg(LOG_LEVEL_ERROR,
+                                                MOD_NAME "invalid af_range "
+                                                "value: expected normal, "
+                                                "macro, or full\n");
+                                return VIDCAP_INIT_FAIL;
+                        }
+                } else if (key == "af_area") {
+                        const af_area_preset *preset =
+                                find_af_area_preset(val);
+                        if (preset == nullptr) {
+                                log_msg(LOG_LEVEL_ERROR,
+                                                MOD_NAME "invalid af_area "
+                                                "value: expected full, mid, "
+                                                "or center\n");
+                                return VIDCAP_INIT_FAIL;
+                        }
+                        opts->af_area_set = true;
+                        opts->af_area_name = preset->name;
+                } else if (key == "ae") {
+                        bool ae_enable = false;
+                        if (!parse_on_off(val, &ae_enable)) {
+                                log_msg(LOG_LEVEL_ERROR,
+                                                MOD_NAME "invalid ae value: "
+                                                "expected on or off\n");
+                                return VIDCAP_INIT_FAIL;
+                        }
+                        opts->ae_set = true;
+                        opts->ae_enable = ae_enable;
+                } else if (key == "metering") {
+                        if (!parse_metering_mode(val, opts)) {
+                                log_msg(LOG_LEVEL_ERROR,
+                                                MOD_NAME "invalid metering "
+                                                "value: expected centre, "
+                                                "spot, or matrix\n");
+                                return VIDCAP_INIT_FAIL;
+                        }
+                } else if (key == "night") {
+                        if (!parse_night_mode(val, opts)) {
+                                log_msg(LOG_LEVEL_ERROR,
+                                                MOD_NAME "invalid night "
+                                                "value: expected off, ir, "
+                                                "or lowlight\n");
+                                return VIDCAP_INIT_FAIL;
+                        }
+                } else if (key == "ae_diag") {
+                        if (!parse_ae_diag_interval(val, opts)) {
+                                log_msg(LOG_LEVEL_ERROR,
+                                                MOD_NAME "invalid ae_diag "
+                                                "value: expected positive "
+                                                "frame interval\n");
+                                return VIDCAP_INIT_FAIL;
+                        }
+                } else if (key == "ev") {
+                        if (!parse_float_option(val, "ev", &opts->ev,
+                                        &opts->ev_set)) {
+                                return VIDCAP_INIT_FAIL;
+                        }
+                } else if (key == "brightness") {
+                        if (!parse_float_option(val, "brightness",
+                                        &opts->brightness,
+                                        &opts->brightness_set)) {
+                                return VIDCAP_INIT_FAIL;
+                        }
+                } else if (key == "saturation") {
+                        if (!parse_float_option(val, "saturation",
+                                        &opts->saturation,
+                                        &opts->saturation_set)) {
+                                return VIDCAP_INIT_FAIL;
+                        }
+                } else if (key == "contrast") {
+                        if (!parse_float_option(val, "contrast",
+                                        &opts->contrast,
+                                        &opts->contrast_set)) {
+                                return VIDCAP_INIT_FAIL;
+                        }
                 } else if (key == "format") {
                         const libcamera_format_mapping *mapping =
                                 find_supported_format(val);
@@ -1109,6 +2320,64 @@ int parse_fmt(std::string_view fmt, libcamera_options *opts)
                                         static_cast<int>(key.size()), key.data());
                         return VIDCAP_INIT_FAIL;
                 }
+        }
+
+        if (opts->focus_afc && opts->focus_manual) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "focus accepts one mode only: afc or "
+                                "manual\n");
+                return VIDCAP_INIT_FAIL;
+        }
+        if (opts->focus_manual && !opts->focus_m_set) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "focus=manual requires focus_m="
+                                "<metres|inf>\n");
+                return VIDCAP_INIT_FAIL;
+        }
+        if (opts->focus_m_set && !opts->focus_manual) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "focus_m is valid only with "
+                                "focus=manual\n");
+                return VIDCAP_INIT_FAIL;
+        }
+        if (opts->af_area_set && !opts->focus_afc) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "af_area is valid only with "
+                                "focus=afc\n");
+                return VIDCAP_INIT_FAIL;
+        }
+        if (opts->af_speed_set && !opts->focus_afc) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "af_speed is valid only with "
+                                "focus=afc\n");
+                return VIDCAP_INIT_FAIL;
+        }
+        if (opts->af_range_set && !opts->focus_afc) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "af_range is valid only with "
+                                "focus=afc\n");
+                return VIDCAP_INIT_FAIL;
+        }
+        if (opts->night_set &&
+                        (opts->night_mode ==
+                                libcamera_options::NightMode::Ir ||
+                         opts->night_mode ==
+                                libcamera_options::NightMode::Lowlight) &&
+                        opts->ae_set && !opts->ae_enable) {
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "night=%s requires AE enabled; "
+                                "cannot combine with ae=off\n",
+                                opts->night_name.c_str());
+                return VIDCAP_INIT_FAIL;
+        }
+        if (opts->focus_set && !opts->focus_afc) {
+                if (opts->focus_manual) {
+                        return VIDCAP_INIT_OK;
+                }
+                log_msg(LOG_LEVEL_ERROR,
+                                MOD_NAME "unsupported focus value: expected "
+                                "manual or afc\n");
+                return VIDCAP_INIT_FAIL;
         }
 
         return VIDCAP_INIT_OK;
@@ -1223,6 +2492,82 @@ void print_known_sensor_caps(const std::shared_ptr<libcamera::Camera> &camera)
                 printf("  Example HDR 720p30: -t libcamera:d=0:hdr:size=1280x720:fps=30:format=YUV420\n");
         }
 
+void print_focus_caps(const std::shared_ptr<libcamera::Camera> &camera)
+{
+        const bool has_af_mode = camera->controls().count(
+                        libcamera::controls::AfMode.id()) > 0;
+        const bool has_lens_position = camera->controls().count(
+                        libcamera::controls::LensPosition.id()) > 0;
+        const bool has_af_speed = camera->controls().count(
+                        libcamera::controls::AfSpeed.id()) > 0;
+        const bool has_af_range = camera->controls().count(
+                        libcamera::controls::AfRange.id()) > 0;
+        const bool has_af_metering = camera->controls().count(
+                        libcamera::controls::AfMetering.id()) > 0;
+        const bool has_af_windows = camera->controls().count(
+                        libcamera::controls::AfWindows.id()) > 0;
+        const std::optional<libcamera::Rectangle> scaler_crop =
+                camera->properties().get(libcamera::properties::ScalerCropMaximum);
+
+        printf("  Focus controls:\n");
+        printf("    AfMode: %s\n", has_af_mode ? "yes" : "no");
+        printf("    LensPosition: %s", has_lens_position ? "yes" : "no");
+        if (has_lens_position) {
+                const auto info = camera->controls().find(
+                                libcamera::controls::LensPosition.id());
+                if (info != camera->controls().end() &&
+                                !info->second.min().isNone() &&
+                                !info->second.max().isNone() &&
+                                !info->second.def().isNone()) {
+                        printf(" min=%.3fD max=%.3fD default=%.3fD",
+                                        info->second.min().get<float>(),
+                                        info->second.max().get<float>(),
+                                        info->second.def().get<float>());
+                } else {
+                        printf(" min/max/default=n/a");
+                }
+        }
+        printf("\n");
+        printf("    AfSpeed: %s\n", has_af_speed ? "yes" : "no");
+        printf("    AfRange: %s\n", has_af_range ? "yes" : "no");
+        printf("    AfMetering: %s\n", has_af_metering ? "yes" : "no");
+        printf("    AfWindows: %s\n", has_af_windows ? "yes" : "no");
+        printf("    ScalerCropMaximum: %s", scaler_crop ? "yes" : "no");
+        if (scaler_crop) {
+                printf(" %s", scaler_crop->toString().c_str());
+        }
+        printf("\n");
+}
+
+void print_exposure_caps(const std::shared_ptr<libcamera::Camera> &camera)
+{
+        const bool has_ae_enable = camera->controls().count(
+                        libcamera::controls::AeEnable.id()) > 0;
+        const bool has_ae_metering = camera->controls().count(
+                        libcamera::controls::AeMeteringMode.id()) > 0;
+        const bool has_ae_exposure = camera->controls().count(
+                        libcamera::controls::AeExposureMode.id()) > 0;
+        const bool has_exposure_value = camera->controls().count(
+                        libcamera::controls::ExposureValue.id()) > 0;
+        const bool has_brightness = camera->controls().count(
+                        libcamera::controls::Brightness.id()) > 0;
+        const bool has_saturation = camera->controls().count(
+                        libcamera::controls::Saturation.id()) > 0;
+        const bool has_contrast = camera->controls().count(
+                        libcamera::controls::Contrast.id()) > 0;
+
+        printf("  Exposure controls:\n");
+        printf("    AeEnable: %s\n", has_ae_enable ? "yes" : "no");
+        printf("    AeMeteringMode: %s\n", has_ae_metering ? "yes" : "no");
+        printf("    AeExposureMode: %s\n", has_ae_exposure ? "yes" : "no");
+        printf("    ExposureValue: %s\n", has_exposure_value ? "yes" : "no");
+        printf("    Brightness: %s\n", has_brightness ? "yes" : "no");
+        printf("    Saturation: %s\n", has_saturation ? "yes" : "no");
+        printf("    Contrast: %s\n", has_contrast ? "yes" : "no");
+        printf("    night=ir: image preset for NoIR/IR illumination; "
+                        "does not switch hardware IR-cut\n");
+}
+
 bool print_camera_help(const std::shared_ptr<libcamera::Camera> &camera,
                 size_t index)
 {
@@ -1277,6 +2622,8 @@ bool inspect_camera_caps(const std::shared_ptr<libcamera::Camera> &camera)
                                 config->at(0);
                         printf("Device %s\n", camera->id().c_str());
                         print_known_sensor_caps(camera);
+                        print_exposure_caps(camera);
+                        print_focus_caps(camera);
                         log_stream_config("generated stream", stream_config);
                         log_stream_formats(stream_config);
                         success = true;
@@ -1289,6 +2636,7 @@ bool inspect_camera_caps(const std::shared_ptr<libcamera::Camera> &camera)
 
 bool configure_camera(vidcap_libcamera_state *s, const libcamera_options &opts)
 {
+        s->opts = opts;
         if (s->camera->acquire() != 0) {
                 log_msg(LOG_LEVEL_ERROR, MOD_NAME "failed to acquire camera\n");
                 return false;
@@ -2252,16 +3600,14 @@ int vidcap_libcamera_init(const struct vidcap_params *params, void **state)
                 } else {
                         std::shared_ptr<libcamera::Camera> camera =
                                 cameras[opts.camera_index];
-                                log_msg(LOG_LEVEL_INFO, MOD_NAME "using camera %zu: %s\n",
-                                                opts.camera_index, camera->id().c_str());
-                                bool hdr_changed = false;
-                                if (opts.hdr_set) {
-                                        if (!resolve_and_apply_hdr_mode(&opts, camera,
-                                                        &hdr_changed)) {
-                                                have_config = false;
-                                                goto init_done;
-                                        }
-                                }
+                        log_msg(LOG_LEVEL_INFO, MOD_NAME "using camera %zu: %s\n",
+                                        opts.camera_index, camera->id().c_str());
+                        bool hdr_changed = false;
+                        if (!resolve_and_apply_hdr_mode(&opts, camera,
+                                        &hdr_changed)) {
+                                have_config = false;
+                                goto init_done;
+                        }
                         if (hdr_changed) {
                                 log_msg(LOG_LEVEL_INFO,
                                                 MOD_NAME "WDR/HDR control "
@@ -2360,6 +3706,10 @@ struct video_frame *vidcap_libcamera_grab(void *state,
                                         MOD_NAME "completed request has no "
                                         "buffer for stream\n");
                 } else {
+                        log_ae_diag_if_needed(s, request,
+                                        buffer->metadata().sequence);
+                        log_focus_metadata_if_needed(s, request);
+
                         const unsigned int width = s->stream_config.size.width;
                         const unsigned int height = s->stream_config.size.height;
                         const codec_t codec = s->desc.color_spec;
@@ -2540,6 +3890,10 @@ struct video_frame *vidcap_libcamera_grab(void *state,
 
                                         request->reuse(
                                                         libcamera::Request::ReuseBuffers);
+                                        if (!request_focus_controls(s, s->opts,
+                                                        request)) {
+                                                return nullptr;
+                                        }
                                         int queue_ret =
                                                 s->camera->queueRequest(request);
                                         if (queue_ret != 0) {
@@ -2556,6 +3910,9 @@ struct video_frame *vidcap_libcamera_grab(void *state,
                 }
 
                 request->reuse(libcamera::Request::ReuseBuffers);
+                if (!request_focus_controls(s, s->opts, request)) {
+                        return nullptr;
+                }
                 int queue_ret = s->camera->queueRequest(request);
                 if (queue_ret != 0) {
                         log_msg(LOG_LEVEL_ERROR,
